@@ -82,7 +82,6 @@ def agent_node(state: MyState) -> MyState:
         returned_messages = result.get("messages", [])
         if returned_messages:
             last = returned_messages[-1]
-            # Ensure we have an AIMessage object (some runtimes return dicts)
             assistant_msg = (
                 last if isinstance(last, AIMessage)
                 else AIMessage(content=getattr(last, "content", str(last)))

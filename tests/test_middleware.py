@@ -8,10 +8,6 @@ import pytest
 
 import hiddenlayer_langchain_guardrails.middleware as m
 
-# -------------------------
-# Test-only shapes (provided via fixtures ONLY)
-# -------------------------
-
 
 @dataclass
 class Msg:
@@ -34,11 +30,6 @@ class ModelResp:
 @dataclass
 class ToolReq:
     tool_call: dict[str, Any]
-
-
-# -------------------------
-# Fixtures: HiddenLayer response builders
-# -------------------------
 
 
 @pytest.fixture()
@@ -67,11 +58,6 @@ def hl_response_builder() -> Callable[..., Any]:
     return _build
 
 
-# -------------------------
-# Fixtures: Params + guardrail
-# -------------------------
-
-
 @pytest.fixture()
 def hl_params() -> m.HiddenLayerParams:
     return m.HiddenLayerParams(model="gpt-4o", project_id=None, requester_id="tester")
@@ -82,11 +68,6 @@ def guardrail(hl_params: m.HiddenLayerParams) -> m.HiddenLayerGuardrail:
     return m.HiddenLayerGuardrail(hl_params)
 
 
-# -------------------------
-# Fixtures: Requests
-# -------------------------
-
-
 @pytest.fixture()
 def model_request() -> ModelReq:
     return ModelReq(messages=[Msg("original user message")])
@@ -95,11 +76,6 @@ def model_request() -> ModelReq:
 @pytest.fixture()
 def tool_request() -> ToolReq:
     return ToolReq(tool_call={"name": "echo", "args": {"text": "hello"}})
-
-
-# -------------------------
-# Fixtures: Handlers
-# -------------------------
 
 
 @pytest.fixture()
@@ -126,12 +102,6 @@ def tool_handler_ok() -> Callable[[ToolReq], str]:
         return "tool ok"
 
     return _handler
-
-
-# -------------------------
-# Fixtures: Patch HiddenLayer analyze scenarios
-#   Each fixture patches m._analyze_content and returns None
-# -------------------------
 
 
 @pytest.fixture()
@@ -175,7 +145,6 @@ def patch_hl_redact_output(monkeypatch: pytest.MonkeyPatch, hl_response_builder)
 @pytest.fixture()
 def patch_hl_block_tool_input(monkeypatch: pytest.MonkeyPatch, hl_response_builder) -> None:
     async def _fake_analyze_content(content: str, role: str, hiddenlayer_params: Any) -> Any:
-        # tool input is treated as role="user" in your implementation
         return hl_response_builder(action="Block", role="user")
 
     monkeypatch.setattr(m, "_analyze_content", _fake_analyze_content)
@@ -199,11 +168,6 @@ def patch_hl_redact_tool_output(monkeypatch: pytest.MonkeyPatch, hl_response_bui
         return hl_response_builder(action="Redact", role="assistant", redacted="REDACTED TOOL OUT")
 
     monkeypatch.setattr(m, "_analyze_content", _fake_analyze_content)
-
-
-# -------------------------
-# Tests (NO inline patching)
-# -------------------------
 
 
 def test_block_input_sync(
