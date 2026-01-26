@@ -23,7 +23,13 @@ Set your credentials in your environment variables to authenticate with HiddenLa
 #### Basic Agent with Guardrails
 ```python
 from langchain.agents import create_agent
+from langchain.tools import tool
 from hiddenlayer_langchain_guardrails import HiddenLayerGuardrail
+
+@tool
+def get_weather(city: str) -> str:
+    """Return simple weather info for the specified city."""
+    return f"The weather in {city} is sunny."
 
 agent = create_agent(
     model="gpt-4o-mini",
@@ -40,8 +46,7 @@ result = agent.invoke(
     }
 )
 
-# Most agent runtimes return a dict with "messages"
-print(result["messages"][-1].content if hasattr(result["messages"][-1], "content") else result["messages"][-1]["content"])
+print(result["messages"][-1].content)
 ```
 
 #### Basic LangGraph Node with Guardrails
