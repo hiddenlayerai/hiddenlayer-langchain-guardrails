@@ -1,22 +1,25 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Awaitable, Callable, Coroutine, Literal, TypeVar
+from typing import Any, Awaitable, Callable, Literal
 
-from hiddenlayer import AsyncHiddenLayer
-from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
+from hiddenlayer import AsyncHiddenLayer, HiddenLayer
+from langchain.agents.middleware import (
+    AgentMiddleware,
+    AgentState,
+    ModelRequest,
+    ModelResponse,
+)
 from langchain.tools.tool_node import ToolCallRequest
+from langgraph.runtime import Runtime
 from pydantic import BaseModel
 
-client = AsyncHiddenLayer()
 logger = logging.getLogger(__name__)
 
-T = TypeVar("T")
+Role = Literal["user", "assistant"]
 
 
 class HiddenLayerParams(BaseModel):
@@ -28,19 +31,17 @@ class HiddenLayerParams(BaseModel):
         requester_id: Identifier for the end-user or calling service (for metadata/audit).
     """
 
-    model: str
+    model: str | None
     project_id: str | None
-    requester_id: str
+    requester_id: str | None
 
 
 class HiddenLayerActions(str, Enum):
     """HiddenLayer evaluation actions supported by this guardrail.
-       Rule set / policy of the project determines the response to detections
-       i.e., 'Alert' vs. 'Block' and redaction type.
 
-    Attributes:
-        BLOCK: The request/response should be blocked.
-        REDACT: The request/response should be redacted (rewritten).
+    Rule set / policy of the project determines the response to detections
+    e.g., 'Alert', 'Allow', 'Block' and 'Redact' (and redaction type).
+    Allow and Alert actions will not interrupt execution.
     """
 
     BLOCK = "Block"
@@ -57,95 +58,30 @@ class OutputBlockedError(Exception):
 
 @dataclass
 class AnalysisResult:
-    """Normalized result derived from a HiddenLayer analysis response.
-
-    Attributes:
-        block: True if HiddenLayer returned action == "Block".
-        redact: True if HiddenLayer returned action == "Redact".
-        redacted_content: Redacted text returned by HiddenLayer (if available).
-    """
+    """Normalized result derived from a HiddenLayer analysis response."""
 
     block: bool
     redact: bool
     redacted_content: str | None
 
 
-async def _analyze_content(
-    content: str,
-    role: Literal["user", "assistant"],
-    hiddenlayer_params: HiddenLayerParams,
-) -> Any:
-    """Call HiddenLayer Interactions Analyze API for a single message.
-
-    Args:
-        content: Message content to analyze.
-        role: Message role. Use "user" to analyze input; "assistant" to analyze output.
-        hiddenlayer_params: HiddenLayer configuration parameters.
-
-    Returns:
-        Raw HiddenLayer SDK response object.
-    """
-    metadata = {"model": hiddenlayer_params.model, "requester_id": hiddenlayer_params.requester_id}
+def _build_analyze_kwargs(content: str, role: Role, params: HiddenLayerParams) -> dict[str, Any]:
+    metadata = {"model": params.model, "requester_id": params.requester_id}
     message = {"messages": [{"role": role, "content": content}]}
 
     kwargs: dict[str, Any] = {"metadata": metadata}
-    if hiddenlayer_params.project_id:
-        kwargs["hl_project_id"] = hiddenlayer_params.project_id
+    if params.project_id:
+        kwargs["hl_project_id"] = params.project_id
 
     if role == "user":
         kwargs["input"] = message
     else:
         kwargs["output"] = message
 
-    return await client.interactions.analyze(**kwargs)
+    return kwargs
 
 
-def _run_async(coro: Coroutine[Any, Any, T]) -> T:
-    """Run an async coroutine from synchronous code.
-
-    This is used to allow `agent.invoke()` / `stream()` (sync code paths) to
-    call the async HiddenLayer client.
-
-    Notes:
-        - If no running event loop exists, uses `asyncio.run`.
-        - If a loop is running (e.g., notebooks), schedules the coroutine using
-          `asyncio.run_coroutine_threadsafe`.
-
-    Args:
-        coro: The coroutine to execute.
-
-    Returns:
-        The coroutine result.
-    """
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        return asyncio.run_coroutine_threadsafe(coro, loop).result()
-    return asyncio.run(coro)
-
-
-async def _analyze_and_extract(
-    *,
-    content: str,
-    role: Literal["user", "assistant"],
-    hiddenlayer_params: HiddenLayerParams,
-) -> AnalysisResult:
-    """Analyze content and normalize HiddenLayer block/redact decisions.
-
-    Args:
-        content: Text to analyze.
-        role: "user" for input analysis or "assistant" for output analysis.
-        hiddenlayer_params: HiddenLayer configuration parameters.
-
-    Returns:
-        A normalized `AnalysisResult` describing block/redact decisions and any
-        redacted content.
-    """
-    response = await _analyze_content(content, role, hiddenlayer_params)
-
+def _extract_result(response: Any, role: Role) -> AnalysisResult:
     action = getattr(getattr(response, "evaluation", None), "action", None)
     logger.debug("HiddenLayer evaluation.action=%r response=%r", action, response)
 
@@ -163,172 +99,192 @@ async def _analyze_and_extract(
     return AnalysisResult(block=block, redact=redact, redacted_content=redacted_content)
 
 
-def _default_params_from_env() -> HiddenLayerParams:
-    """Load HiddenLayer params from environment variables.
+def _get_request_last_content(request: ModelRequest) -> str | None:
+    if not request.messages:
+        return None
+    content = getattr(request.messages[-1], "content", None)
+    return content if isinstance(content, str) and content else None
 
-    Environment variables:
-        HL_MODEL: Model name to attach to metadata (default: "gpt-4o").
-        HL_REQUESTER_ID: Requester identifier (default: "unknown").
-        HL_PROJECT_ID: Optional project ID to apply a specific policy.
 
-    Returns:
-        A `HiddenLayerParams` instance.
+def _replace_last_message(request: ModelRequest, text: str) -> ModelRequest:
+    last = request.messages[-1]
+    new_last = last.__class__(content=text)
+    return request.override(messages=[*request.messages[:-1], new_last])
+
+
+def _get_response_content(response: ModelResponse) -> str | None:
+    msg = getattr(response, "message", None)
+    content = getattr(msg, "content", None)
+    return content if isinstance(content, str) and content else None
+
+
+def _set_response_content(response: ModelResponse, text: str) -> None:
+    msg = getattr(response, "message", None)
+    if msg is not None:
+        msg.content = text
+
+
+def _apply_tool_input_redaction(request: ToolCallRequest, redacted_payload: str) -> ToolCallRequest:
     """
-    return HiddenLayerParams(
-        model=os.getenv("HL_MODEL", "gpt-4o"),
-        requester_id=os.getenv("HL_REQUESTER_ID", "unknown"),
-        project_id=os.getenv("HL_PROJECT_ID") or None,
-    )
-
-
-class HiddenLayerGuardrail(AgentMiddleware):
-    """Custom LangChain agent middleware that implements HiddenLayer runtime security as a guardrail.
-
-    This middleware intercepts:
-      - model input (user messages) and output (assistant responses)
-      - tool input (tool args JSON) and tool output (stringified result)
-
-    It uses the async HiddenLayer client under the hood but supports both:
-      - sync agent execution (`invoke`, `stream`)
-      - async agent execution (`ainvoke`, `astream`)
-
-    Args:
-        params: Optional `HiddenLayerParams`. If not provided, values are loaded
-            from environment using `_default_params_from_env()`.
+    Apply redacted tool input payload to ToolCallRequest. If redacted_content,
+    overwrite request.tool_call["args"] with redacted content.
     """
+    try:
+        parsed = json.loads(redacted_payload)
+    except Exception:
+        logger.warning("Failed to parse redacted tool payload as JSON: %r", redacted_payload)
+        return request
+
+    if not isinstance(parsed, dict) or "args" not in parsed or not isinstance(parsed["args"], dict):
+        logger.warning("Redacted tool payload missing expected 'args' dict: %r", parsed)
+        return request
+
+    tool_call = getattr(request, "tool_call", None)
+    if not isinstance(tool_call, dict):
+        return request
+
+    tool_call["args"] = parsed["args"]
+    return request
+
+
+class HiddenLayerGuardrailBase(AgentMiddleware):
+    """Base class for sync and async HiddenLayer guardrails."""
 
     def __init__(self, params: HiddenLayerParams | None = None):
         super().__init__()
-        self.params = params or _default_params_from_env()
+        self.params = params
 
-    def wrap_model_call(self, request: ModelRequest, handler: Callable[[ModelRequest], ModelResponse]) -> ModelResponse:
-        """Synchronous wrapper for model calls.
+    def _on_input_result(self, request: ModelRequest, result: AnalysisResult) -> ModelRequest:
+        if result.block:
+            raise InputBlockedError("Input blocked by HiddenLayer")
+        if result.redact and result.redacted_content:
+            return _replace_last_message(request, result.redacted_content)
+        return request
 
-        Args:
-            request: LangChain model request.
-            handler: Callable that performs the actual model call.
-
-        Returns:
-            ModelResponse after optional redaction.
-
-        Raises:
-            InputBlockedError: If HiddenLayer blocks input.
-            OutputBlockedError: If HiddenLayer blocks output.
-        """
-        if request.messages:
-            last = request.messages[-1]
-            content = getattr(last, "content", None)
-
-            if isinstance(content, str) and content:
-                res_in = _run_async(_analyze_and_extract(content=content, role="user", hiddenlayer_params=self.params))
-                if res_in.block:
-                    raise InputBlockedError("Input blocked by HiddenLayer")
-                if res_in.redact and res_in.redacted_content:
-                    new_last = last.__class__(content=res_in.redacted_content)
-                    request = request.override(messages=[*request.messages[:-1], new_last])
-
-        response = handler(request)
-
-        msg = getattr(response, "message", None)
-        out = getattr(msg, "content", None)
-
-        if isinstance(out, str) and out:
-            res_out = _run_async(_analyze_and_extract(content=out, role="assistant", hiddenlayer_params=self.params))
-            if res_out.block:
-                raise OutputBlockedError("Output blocked by HiddenLayer")
-            if res_out.redact and res_out.redacted_content and msg is not None:
-                msg.content = res_out.redacted_content
-
+    def _on_output_result(self, response: ModelResponse, result: AnalysisResult) -> ModelResponse:
+        if result.block:
+            raise OutputBlockedError("Output blocked by HiddenLayer")
+        if result.redact and result.redacted_content:
+            _set_response_content(response, result.redacted_content)
         return response
 
-    def wrap_tool_call(self, request: ToolCallRequest, handler: Callable[[ToolCallRequest], Any]) -> Any:
-        """Synchronous wrapper for tool calls.
 
-        Args:
-            request: Tool call request (contains tool name + args).
-            handler: Callable that executes the tool.
+class AsyncHiddenLayerGuardrail(HiddenLayerGuardrailBase):
+    """
+    Supports asynchronous agent execution with `ainvoke` and `astream`.
+    Uses AsyncHiddenLayer client and async middleware hooks.
 
-        Returns:
-            Tool output, optionally redacted if HiddenLayer requests redaction.
+    The middleware analyzes:
+      - model input (user messages) and output (assistant responses)
+      - tool input (tool args JSON) and tool output (stringified result)
+    """
 
-        Raises:
-            InputBlockedError: If HiddenLayer blocks tool input.
-            OutputBlockedError: If HiddenLayer blocks tool output.
-        """
-        tool_call = getattr(request, "tool_call", {}) or {}
-        tool_name = tool_call.get("name", "<unknown>")
-        tool_args = tool_call.get("args", {}) or {}
+    def __init__(self, params: HiddenLayerParams | None = None, client: AsyncHiddenLayer | None = None):
+        super().__init__(params=params)
+        self.client = client or AsyncHiddenLayer()
 
-        tool_payload = json.dumps({"args": tool_args}, ensure_ascii=False)
-        res_in = _run_async(_analyze_and_extract(content=tool_payload, role="user", hiddenlayer_params=self.params))
-        if res_in.block:
-            raise InputBlockedError(f"Tool input for {tool_name} blocked by HiddenLayer")
+    async def analyze(self, *, content: str, role: Role) -> AnalysisResult:
+        kwargs = _build_analyze_kwargs(content, role, self.params)
+        resp = await self.client.interactions.analyze(**kwargs)
+        return _extract_result(resp, role)
 
-        output = handler(request)
+    @AgentMiddleware.abefore_model
+    async def check_model_input(self, state: AgentState, runtime: Runtime, request: ModelRequest) -> ModelRequest:
+        content = _get_request_last_content(request)
+        if not content:
+            return request
+        result = await self.analyze(content=content, role="user")
+        return self._on_input_result(request, result)
 
-        res_out = _run_async(
-            _analyze_and_extract(content=str(output), role="assistant", hiddenlayer_params=self.params)
-        )
-        if res_out.block:
-            raise OutputBlockedError(f"Tool output from {tool_name} blocked by HiddenLayer")
-
-        return res_out.redacted_content if (res_out.redact and res_out.redacted_content) else output
-
-    async def awrap_model_call(
-        self,
-        request: ModelRequest,
-        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    @AgentMiddleware.aafter_model
+    async def check_model_output(
+        self, state: AgentState, runtime: Runtime, request: ModelRequest, response: ModelResponse
     ) -> ModelResponse:
-        """Async wrapper for model calls.
-
-        Raises:
-            InputBlockedError: If HiddenLayer blocks input.
-            OutputBlockedError: If HiddenLayer blocks output.
-        """
-        if request.messages:
-            last = request.messages[-1]
-            content = getattr(last, "content", None)
-
-            if isinstance(content, str) and content:
-                res_in = await _analyze_and_extract(content=content, role="user", hiddenlayer_params=self.params)
-                if res_in.block:
-                    raise InputBlockedError("Input blocked by HiddenLayer")
-                if res_in.redact and res_in.redacted_content:
-                    new_last = last.__class__(content=res_in.redacted_content)
-                    request = request.override(messages=[*request.messages[:-1], new_last])
-
-        response = await handler(request)
-
-        msg = getattr(response, "message", None)
-        out = getattr(msg, "content", None)
-        if isinstance(out, str) and out:
-            res_out = await _analyze_and_extract(content=out, role="assistant", hiddenlayer_params=self.params)
-            if res_out.block:
-                raise OutputBlockedError("Output blocked by HiddenLayer")
-            if res_out.redact and res_out.redacted_content and msg is not None:
-                msg.content = res_out.redacted_content
-
-        return response
+        content = _get_response_content(response)
+        if not content:
+            return response
+        result = await self.analyze(content=content, role="assistant")
+        return self._on_output_result(response, result)
 
     async def awrap_tool_call(
         self,
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Awaitable[Any]],
     ) -> Any:
-        """Async wrapper for tool calls."""
         tool_call = getattr(request, "tool_call", {}) or {}
         tool_name = tool_call.get("name", "<unknown>")
         tool_args = tool_call.get("args", {}) or {}
 
         tool_payload = json.dumps({"args": tool_args}, ensure_ascii=False)
-        res_in = await _analyze_and_extract(content=tool_payload, role="user", hiddenlayer_params=self.params)
-        if res_in.block:
+        in_res = await self.analyze(content=tool_payload, role="user")
+        if in_res.block:
             raise InputBlockedError(f"Tool input for {tool_name} blocked by HiddenLayer")
+
+        if in_res.redact and in_res.redacted_content:
+            request = _apply_tool_input_redaction(request, in_res.redacted_content)
 
         output = await handler(request)
 
-        res_out = await _analyze_and_extract(content=str(output), role="assistant", hiddenlayer_params=self.params)
-        if res_out.block:
+        out_res = await self.analyze(content=str(output), role="assistant")
+        if out_res.block:
             raise OutputBlockedError(f"Tool output from {tool_name} blocked by HiddenLayer")
 
-        return res_out.redacted_content if (res_out.redact and res_out.redacted_content) else output
+        return out_res.redacted_content if (out_res.redact and out_res.redacted_content) else output
+
+
+class HiddenLayerGuardrail(HiddenLayerGuardrailBase):
+    """Supports synchronous agent execution with `invoke` and `stream`.
+       Use AsyncHiddenLayerGuardrail to take advantage of LangChain's async support.
+
+    This middleware analyzes:
+      - model input (user messages) and output (assistant responses)
+      - tool input (tool args JSON) and tool output (stringified result)
+    """
+
+    def __init__(self, params: HiddenLayerParams | None = None, client: HiddenLayer | None = None):
+        super().__init__(params=params)
+        self.client = client or HiddenLayer()
+
+    def analyze(self, *, content: str, role: Role) -> AnalysisResult:
+        kwargs = _build_analyze_kwargs(content, role, self.params)
+        resp = self.client.interactions.analyze(**kwargs)
+        return _extract_result(resp, role)
+
+    @AgentMiddleware.before_model
+    def check_model_input(self, state: AgentState, runtime: Runtime, request: ModelRequest) -> ModelRequest:
+        content = _get_request_last_content(request)
+        if not content:
+            return request
+        result = self.analyze(content=content, role="user")
+        return self._on_input_result(request, result)
+
+    @AgentMiddleware.after_model
+    def check_model_output(
+        self, state: AgentState, runtime: Runtime, request: ModelRequest, response: ModelResponse
+    ) -> ModelResponse:
+        content = _get_response_content(response)
+        if not content:
+            return response
+        result = self.analyze(content=content, role="assistant")
+        return self._on_output_result(response, result)
+
+    def wrap_tool_call(self, request: ToolCallRequest, handler: Callable[[ToolCallRequest], Any]) -> Any:
+        tool_call = getattr(request, "tool_call", {}) or {}
+        tool_name = tool_call.get("name", "<unknown>")
+        tool_args = tool_call.get("args", {}) or {}
+
+        tool_payload = json.dumps({"args": tool_args}, ensure_ascii=False)
+        in_res = self.analyze(content=tool_payload, role="user")
+        if in_res.block:
+            raise InputBlockedError(f"Tool input for {tool_name} blocked by HiddenLayer")
+
+        if in_res.redact and in_res.redacted_content:
+            request = _apply_tool_input_redaction(request, in_res.redacted_content)
+
+        output = handler(request)
+
+        out_res = self.analyze(content=str(output), role="assistant")
+        if out_res.block:
+            raise OutputBlockedError(f"Tool output from {tool_name} blocked by HiddenLayer")
+
+        return out_res.redacted_content if (out_res.redact and out_res.redacted_content) else output
