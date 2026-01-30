@@ -9,7 +9,7 @@ If you are unable to access the form, you can also report a security vulnerabili
 If you send us an email, please provide the following information:
 
 * PROJECT: A URL to project's repository
-* PUBLIC: Please let us know if this vulnerability has been made or discussed publicly already. If so, please let us know where. 
+* PUBLIC: Please let us know if this vulnerability has been made or discussed publicly already. If so, please let us know where.
 * DESCRIPTION: Please provide precise description of the security vulnerability you have found with as much information that you are able and willing to provide.
 
 Please send the above info, along with any other information you feel is pertinent to: <disclosure@hiddenlayer.com>.
