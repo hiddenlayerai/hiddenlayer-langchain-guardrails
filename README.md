@@ -3,7 +3,7 @@
 This package provides a LangChain agent middleware that integrates with the
 [HiddenLayer Python SDK](https://github.com/hiddenlayerai/hiddenlayer-sdk-python) to scan, redact, and/or block content before and after the agent executes.
 
-It follows the official LangChain [custom guardrails](https://docs.langchain.com/oss/python/langchain/guardrails#custom-guardrails) middleware pattern and works with agents and tools.
+It follows the official LangChain [custom guardrails](https://docs.langchain.com/oss/python/langchain/guardrails#custom-guardrails) middleware pattern using wrap-style hooks to intercept model and tool request and responses.
 
 ### Installation
 
@@ -20,7 +20,6 @@ Set your credentials in your environment variables to authenticate with HiddenLa
 ---
 
 ### Usage
-#### Basic Agent with Guardrails
 ```python
 from langchain.agents import create_agent
 from langchain.tools import tool
@@ -34,7 +33,13 @@ def get_weather(city: str) -> str:
 agent = create_agent(
     model="gpt-4o-mini",
     tools=[get_weather],
-    middleware=[HiddenLayerGuardrail()],
+    middleware=[HiddenLayerGuardrail(
+    params=HiddenLayerParams(
+        model="gpt-4o-mini",
+        project_id=None,          # or your HL project id
+        requester_id="example",   # optional but recommended
+    )
+    )],
 )
 
 result = agent.invoke(
@@ -49,84 +54,60 @@ result = agent.invoke(
 print(result["messages"][-1].content)
 ```
 
-#### Basic LangGraph Node with Guardrails
+#### Async Usage
 ```python
-from typing import List, TypedDict
-
-from langgraph.graph import StateGraph, END
-from langchain.agents import create_agent
-from langchain.tools import tool
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-
-from hiddenlayer_langchain_guardrails import HiddenLayerGuardrail, InputBlockedError, OutputBlockedError
+from hiddenlayer_langchain_guardrails import (
+    AsyncHiddenLayerGuardrail,
+    HiddenLayerParams,
+)
 
 @tool
 def get_weather(city: str) -> str:
-    """Return a simple weather sentence for the given city."""
+    """Return simple weather info for the specified city."""
     return f"The weather in {city} is sunny."
 
-agent = create_agent(
-    model="gpt-4o",
-    tools=[get_weather],
-    middleware=[HiddenLayerGuardrail()],
+guardrail = AsyncHiddenLayerGuardrail(
+    params=HiddenLayerParams(
+        model="gpt-4o-mini",
+        project_id=None,          # or your HL project id
+        requester_id="example",   # optional but recommended
+    )
 )
 
-class MyState(TypedDict):
-    messages: List[SystemMessage | HumanMessage | AIMessage]
+agent = create_agent(
+    model="gpt-4o-mini",
+    tools=[get_weather],
+    middleware=[guardrail],
+)
 
-def agent_node(state: MyState) -> MyState:
-    """Graph node that calls the agent and appends the assistant reply to messages.
+async def main() -> None:
+    result = await agent.ainvoke(
+        {
+            "messages": [
+                {"role": "system", "content": "Always respond in haiku form."},
+                {
+                    "role": "user",
+                    "content": "What's the weather in Austin? Use the get_weather tool.",
+                },
+            ]
+        }
+    )
 
-    The middleware (HiddenLayerGuardrail) will run automatically for:
-      - model input (the user's message)
-      - model output (assistant response)
-      - tool input and tool output when the agent invokes `get_weather`.
-    """
-    try:
-        result = agent.invoke({"messages": state["messages"]})
-        returned_messages = result.get("messages", [])
-        if returned_messages:
-            last = returned_messages[-1]
-            assistant_msg = (
-                last if isinstance(last, AIMessage)
-                else AIMessage(content=getattr(last, "content", str(last)))
-            )
-            return {"messages": state["messages"] + [assistant_msg]}
-        return state
+    print(result["messages"][-1].content)
 
-    except InputBlockedError:
-        return {"messages": state["messages"] + [AIMessage(content="Blocked by guardrail (input).")]}
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
 
-    except OutputBlockedError:
-        return {"messages": state["messages"] + [AIMessage(content="Blocked by guardrail (output).")]}
-
-graph = StateGraph(MyState)
-graph.add_node("agent", agent_node)
-graph.set_entry_point("agent")
-graph.add_edge("agent", END)
-app = graph.compile()
-
-initial_state: MyState = {
-    "messages": [
-        SystemMessage(content="You are a helpful assistant. Answer in haiku when asked for weather."),
-        HumanMessage(content="What's the weather in Austin? Use the get_weather tool."),
-    ]
-}
-
-final_state = app.invoke(initial_state)
-
-last_msg = final_state["messages"][-1]
-print(getattr(last_msg, "content", str(last_msg)))
 ```
 
-
 ### How it works
-- `hiddenlayer_langchain_guardrails.middleware.HiddenLayerGuardrail` provides implements `AgentMiddleware` and is configured with:
+- `hiddenlayer_langchain_guardrails.middleware` provides `AsyncHiddenLayerGuardrail` and `HiddenLayerGuardrail` and is configured with:
   - Model-level input/output guardrails that analyze user and assistant messages provided when the agent is invoked
   - Tool-level guardrails that inspect arguments before execution and outputs afterward
-  - Personal Identifiable Information (PII) in the input/output at the model- and tool-level is redacted
-- Guardrails rely on `AsyncHiddenLayer.interactions.analyze` and will raise when HiddenLayer signals a blocking action.
+  - Readaction in the input and output at the model- and tool-level
+- Guardrails rely on the HiddenLayer REST API and will raise an exception when HiddenLayer signals a blocking action
 
 ### Development
 Run tests after installing dev deps (`pytest` and `pytest-asyncio`): `pytest tests`
-Code lives in [src/hiddenlayer_langchain_guardrails/middleware.py](./src/hiddenlayer_langchain_guardrails/middleware.py); tests are in [tests/middleware.py](./tests/tests_middleware.py).
+Code lives in [src/hiddenlayer_langchain_guardrails/middleware.py](./src/hiddenlayer_langchain_guardrails/middleware.py); tests are under the [tests](./tests/) directory.
