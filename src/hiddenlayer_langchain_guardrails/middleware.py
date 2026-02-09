@@ -1,4 +1,5 @@
 from __future__ import annotations
+from langchain.agents import AgentState
 
 import json
 import logging
@@ -10,6 +11,7 @@ from hiddenlayer import AsyncHiddenLayer, HiddenLayer
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
 from langchain.tools.tool_node import ToolCallRequest
 from pydantic import BaseModel
+from langgraph.runtime import Runtime
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +23,7 @@ class HiddenLayerParams(BaseModel):
 
     model: str | None = None
     project_id: str | None = None
-    requester_id: str | None = None
+    requester_id: str = "hiddenlayer-langchain-integration"
 
 
 class HiddenLayerActions(str, Enum):
@@ -101,8 +103,18 @@ def _replace_last_message(request: ModelRequest, text: str) -> ModelRequest:
 
 def _get_response_content(response: ModelResponse) -> str | None:
     """Return response message content if it is a non-empty string."""
-    msg = getattr(response, "message", None)
+    msg = getattr(response, "message", None) or getattr(response, "result")
+
+    if isinstance(msg, list):
+        msg = msg[-1]
+
     content = getattr(msg, "content", None)
+
+    # If a model responds saying to run a tool, the content gets parsed into a tool calls field.
+    tool_calls = getattr(msg, "tool_calls", None)
+    if tool_calls:
+        content = json.dumps(tool_calls)
+
     return content if isinstance(content, str) and content else None
 
 
