@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable, Literal
 from hiddenlayer import AsyncHiddenLayer, HiddenLayer
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
 from langchain.tools.tool_node import ToolCallRequest
+import os
 from pydantic import BaseModel
 from langgraph.runtime import Runtime
 
@@ -22,8 +23,8 @@ class HiddenLayerParams(BaseModel):
     """HiddenLayer request metadata and policy routing parameters."""
 
     model: str | None = None
-    project_id: str | None = None
-    requester_id: str = "hiddenlayer-langchain-integration"
+    project_id: str | None = os.getenv("HIDDENLAYER_PROJECT_ID")
+    requester_id: str = os.getenv("HIDDENLAYER_REQUESTER_ID", "hiddenlayer-langchain-integration")
 
 
 class HiddenLayerActions(str, Enum):
@@ -223,7 +224,7 @@ class AsyncHiddenLayerGuardrail(HiddenLayerGuardrailBase):
 
         output = await handler(request)
 
-        out_res = await self.analyze(content=str(output), role="assistant")
+        out_res = await self.analyze(content=str(output), role="user")
         if out_res.block:
             raise OutputBlockedError(f"Tool output from {tool_name} blocked by HiddenLayer")
 
@@ -280,7 +281,7 @@ class HiddenLayerGuardrail(HiddenLayerGuardrailBase):
 
         output = handler(request)
 
-        out_res = self.analyze(content=str(output), role="assistant")
+        out_res = self.analyze(content=str(output), role="user")
         if out_res.block:
             raise OutputBlockedError(f"Tool output from {tool_name} blocked by HiddenLayer")
 
