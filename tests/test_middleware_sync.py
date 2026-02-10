@@ -236,7 +236,7 @@ def test_sync_wrap_tool_call_redact_output_returns_redacted_content(
 ):
     sync_client_mock.interactions.analyze.side_effect = [
         make_hl_response(action=None, role="user"),
-        make_hl_response(action=HiddenLayerActions.REDACT, role="assistant", redacted_text="REDACTED_TOOL_OUT"),
+        make_hl_response(action=HiddenLayerActions.REDACT, role="user", redacted_text="REDACTED_TOOL_OUT"),
     ]
 
     ToolReq = dummy_tool_request_class
