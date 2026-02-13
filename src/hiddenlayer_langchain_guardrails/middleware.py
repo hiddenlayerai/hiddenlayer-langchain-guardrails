@@ -211,11 +211,12 @@ class AsyncHiddenLayerGuardrail(HiddenLayerGuardrailBase):
         handler: Callable[[ToolCallRequest], Awaitable[Any]],
     ) -> Any:
         tool_call = getattr(request, "tool_call", {}) or {}
+        print(tool_call)
         tool_name = tool_call.get("name", "<unknown>")
         tool_args = tool_call.get("args", {}) or {}
-
-        tool_payload = json.dumps({"args": tool_args}, ensure_ascii=False)
-        in_res = await self.analyze(content=tool_payload, role="user")
+        tool_description = tool_call.get("description", "")
+        tool_payload = {"name": tool_name, "description": tool_description, "args": tool_args}
+        in_res = await self.analyze(content=json.dumps(tool_payload), role="user")
         if in_res.block:
             raise InputBlockedError(f"Tool input for {tool_name} blocked by HiddenLayer")
 
@@ -270,9 +271,10 @@ class HiddenLayerGuardrail(HiddenLayerGuardrailBase):
         tool_call = getattr(request, "tool_call", {}) or {}
         tool_name = tool_call.get("name", "<unknown>")
         tool_args = tool_call.get("args", {}) or {}
+        tool_description = tool_call.get("description", "")
 
-        tool_payload = json.dumps({"args": tool_args}, ensure_ascii=False)
-        in_res = self.analyze(content=tool_payload, role="user")
+        tool_payload = {"name": tool_name, "description": tool_description, "args": tool_args}
+        in_res = self.analyze(content=json.dumps(tool_payload), role="user")
         if in_res.block:
             raise InputBlockedError(f"Tool input for {tool_name} blocked by HiddenLayer")
 
