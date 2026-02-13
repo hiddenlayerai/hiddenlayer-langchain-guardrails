@@ -23,7 +23,7 @@ Set your credentials in your environment variables to authenticate with HiddenLa
 ```python
 from langchain.agents import create_agent
 from langchain.tools import tool
-from hiddenlayer_langchain_guardrails import HiddenLayerGuardrail
+from hiddenlayer_langchain_guardrails import HiddenLayerGuardrail, HiddenLayerParams
 
 @tool
 def get_weather(city: str) -> str:

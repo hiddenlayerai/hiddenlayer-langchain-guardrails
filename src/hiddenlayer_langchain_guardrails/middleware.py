@@ -1,4 +1,5 @@
 from __future__ import annotations
+from langchain.agents import AgentState
 
 import json
 import logging
@@ -9,7 +10,9 @@ from typing import Any, Awaitable, Callable, Literal
 from hiddenlayer import AsyncHiddenLayer, HiddenLayer
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
 from langchain.tools.tool_node import ToolCallRequest
+import os
 from pydantic import BaseModel
+from langgraph.runtime import Runtime
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +23,8 @@ class HiddenLayerParams(BaseModel):
     """HiddenLayer request metadata and policy routing parameters."""
 
     model: str | None = None
-    project_id: str | None = None
-    requester_id: str | None = None
+    project_id: str | None = os.getenv("HIDDENLAYER_PROJECT_ID")
+    requester_id: str = os.getenv("HIDDENLAYER_REQUESTER_ID", "hiddenlayer-langchain-integration")
 
 
 class HiddenLayerActions(str, Enum):
@@ -101,8 +104,18 @@ def _replace_last_message(request: ModelRequest, text: str) -> ModelRequest:
 
 def _get_response_content(response: ModelResponse) -> str | None:
     """Return response message content if it is a non-empty string."""
-    msg = getattr(response, "message", None)
+    msg = getattr(response, "message", None) or getattr(response, "result")
+
+    if isinstance(msg, list):
+        msg = msg[-1]
+
     content = getattr(msg, "content", None)
+
+    # If a model responds saying to run a tool, the content gets parsed into a tool calls field.
+    tool_calls = getattr(msg, "tool_calls", None)
+    if tool_calls:
+        content = json.dumps(tool_calls)
+
     return content if isinstance(content, str) and content else None
 
 
@@ -198,11 +211,12 @@ class AsyncHiddenLayerGuardrail(HiddenLayerGuardrailBase):
         handler: Callable[[ToolCallRequest], Awaitable[Any]],
     ) -> Any:
         tool_call = getattr(request, "tool_call", {}) or {}
+        print(tool_call)
         tool_name = tool_call.get("name", "<unknown>")
         tool_args = tool_call.get("args", {}) or {}
-
-        tool_payload = json.dumps({"args": tool_args}, ensure_ascii=False)
-        in_res = await self.analyze(content=tool_payload, role="user")
+        tool_description = tool_call.get("description", "")
+        tool_payload = {"name": tool_name, "description": tool_description, "args": tool_args}
+        in_res = await self.analyze(content=json.dumps(tool_payload), role="user")
         if in_res.block:
             raise InputBlockedError(f"Tool input for {tool_name} blocked by HiddenLayer")
 
@@ -211,7 +225,7 @@ class AsyncHiddenLayerGuardrail(HiddenLayerGuardrailBase):
 
         output = await handler(request)
 
-        out_res = await self.analyze(content=str(output), role="assistant")
+        out_res = await self.analyze(content=str(output), role="user")
         if out_res.block:
             raise OutputBlockedError(f"Tool output from {tool_name} blocked by HiddenLayer")
 
@@ -257,9 +271,10 @@ class HiddenLayerGuardrail(HiddenLayerGuardrailBase):
         tool_call = getattr(request, "tool_call", {}) or {}
         tool_name = tool_call.get("name", "<unknown>")
         tool_args = tool_call.get("args", {}) or {}
+        tool_description = tool_call.get("description", "")
 
-        tool_payload = json.dumps({"args": tool_args}, ensure_ascii=False)
-        in_res = self.analyze(content=tool_payload, role="user")
+        tool_payload = {"name": tool_name, "description": tool_description, "args": tool_args}
+        in_res = self.analyze(content=json.dumps(tool_payload), role="user")
         if in_res.block:
             raise InputBlockedError(f"Tool input for {tool_name} blocked by HiddenLayer")
 
@@ -268,7 +283,7 @@ class HiddenLayerGuardrail(HiddenLayerGuardrailBase):
 
         output = handler(request)
 
-        out_res = self.analyze(content=str(output), role="assistant")
+        out_res = self.analyze(content=str(output), role="user")
         if out_res.block:
             raise OutputBlockedError(f"Tool output from {tool_name} blocked by HiddenLayer")
 

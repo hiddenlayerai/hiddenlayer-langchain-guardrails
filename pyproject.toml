@@ -38,6 +38,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "langchain-mcp-adapters>=0.2.1",
     "pytest>=9.0.1",
     "pytest-asyncio>=1.3.0",
     "ruff>=0.14.14",
