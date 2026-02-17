@@ -101,6 +101,14 @@ if __name__ == "__main__":
 
 ```
 
+### Capability Matrix
+
+| | Alert | Block | Redact |
+|---|:---:|:---:|:---:|
+| **Input Guardrails** | :x: | :white_check_mark: | :white_check_mark: |
+| **Output Guardrails** | :x: | :white_check_mark: | :white_check_mark: |
+| **Streaming Output Guardrails** | :x: | :white_check_mark: | :x: |
+
 ### How it works
 - `hiddenlayer_langchain_guardrails.middleware` provides `AsyncHiddenLayerGuardrail` and `HiddenLayerGuardrail` and is configured with:
   - Model-level input/output guardrails that analyze user and assistant messages provided when the agent is invoked
