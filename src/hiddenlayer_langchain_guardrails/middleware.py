@@ -3,9 +3,11 @@ from langchain.agents import AgentState
 
 import json
 import logging
+import threading
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterator, Literal
 
 from hiddenlayer import AsyncHiddenLayer, HiddenLayer
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
@@ -231,6 +233,97 @@ class AsyncHiddenLayerGuardrail(HiddenLayerGuardrailBase):
 
         return out_res.redacted_content if (out_res.redact and out_res.redacted_content) else output
 
+    async def aguarded_stream(
+        self,
+        stream: AsyncIterator[Any],
+        *,
+        threshold: int = 0,
+        overlap: int = 0,
+    ) -> AsyncIterator[Any]:
+        """
+        Async wrapper around a stream that buffers events and submits them
+        for HiddenLayer output scanning without blocking the stream.
+
+        When *threshold* is 0 (the default) all events are collected first,
+        scanned, and then yielded. When *threshold* is a positive integer, a
+        scan is fired every *threshold* events and events are yielded as they
+        arrive.
+
+        Args:
+            stream: The async iterable to wrap (e.g. ``agent.astream(...)``).
+            threshold: Number of events to buffer before submitting a scan.
+                0 means buffer everything and scan once at the end.
+            overlap: Number of events from the end of the previous window to
+                include at the start of the next window. Only meaningful when
+                *threshold* > 0. Defaults to 0.
+
+        Yields:
+            Each event from the original *stream*, unchanged.
+        """
+        import asyncio
+
+        if threshold == 0:
+            buffer: list[Any] = []
+            accumulated = ""
+            async for event in stream:
+                buffer.append(event)
+                msg = event[0] if isinstance(event, tuple) else event
+                content = getattr(msg, "content", None)
+                if content:
+                    accumulated += content
+
+            if accumulated:
+                kwargs = _build_analyze_kwargs(accumulated, "assistant", self.params)
+                resp = await self.client.interactions.analyze(**kwargs)
+                result = _extract_result(resp, "assistant")
+                if result.block:
+                    raise OutputBlockedError(
+                        "Output blocked by HiddenLayer: content was flagged as malicious"
+                    )
+
+            for event in buffer:
+                yield event
+            return
+
+        # Windowed mode: yield events immediately, fire scans in background.
+        window: deque[Any] = deque()
+        carry: list[Any] = []
+
+        async for event in stream:
+            msg = event[0] if isinstance(event, tuple) else event
+            content = getattr(msg, "content", None)
+
+            window.append(content or "")
+
+            if len(window) >= threshold:
+                scan_parts = [c for c in [*carry, *window] if c]
+                scan_text = "".join(scan_parts)
+                if scan_text:
+                    asyncio.ensure_future(self._asubmit_scan(scan_text))
+
+                carry = list(window)[-overlap:] if overlap > 0 else []
+                window.clear()
+
+            yield event
+
+        # Flush remaining events in the window.
+        if window:
+            scan_parts = [c for c in [*carry, *window] if c]
+            scan_text = "".join(scan_parts)
+            if scan_text:
+                asyncio.ensure_future(self._asubmit_scan(scan_text))
+
+    async def _asubmit_scan(self, text: str) -> None:
+        """Fire-and-forget an async scan."""
+        try:
+            kwargs = _build_analyze_kwargs(text, "assistant", self.params)
+            resp = await self.client.interactions.analyze(**kwargs)
+            result = _extract_result(resp, "assistant")
+            if result.block:
+                logger.warning("HiddenLayer blocked streamed output chunk")
+        except Exception:
+            logger.exception("Background HiddenLayer scan failed")
+
 
 class HiddenLayerGuardrail(HiddenLayerGuardrailBase):
     """Sync guardrail that wraps model/tool calls and enforces HiddenLayer decisions."""
@@ -288,3 +381,98 @@ class HiddenLayerGuardrail(HiddenLayerGuardrailBase):
             raise OutputBlockedError(f"Tool output from {tool_name} blocked by HiddenLayer")
 
         return out_res.redacted_content if (out_res.redact and out_res.redacted_content) else output
+
+    def guarded_stream(
+        self,
+        stream: Iterator[Any],
+        *,
+        threshold: int = 0,
+        overlap: int = 0,
+    ) -> Iterator[Any]:
+        """
+        Wrap a stream iterable, buffering events and submitting them for
+        HiddenLayer output scanning in the background.
+
+        Events are yielded back to the caller immediately; scanning does not
+        block the stream. When *threshold* is 0 (the default) all events are
+        collected first, scanned, and then yielded. When *threshold* is a
+        positive integer, a scan is submitted every *threshold* events and
+        events are yielded as they arrive.
+
+        Args:
+            stream: The iterable to wrap (e.g. ``agent.stream(...)``).
+            threshold: Number of events to buffer before submitting a scan.
+                0 means buffer everything and scan once at the end.
+            overlap: Number of events from the end of the previous window to
+                include at the start of the next window. Only meaningful when
+                *threshold* > 0. Defaults to 0.
+
+        Yields:
+            Each event from the original *stream*, unchanged.
+        """
+        if threshold == 0:
+            # Buffer everything, scan once, then yield.
+            buffer: list[Any] = []
+            accumulated = ""
+            for event in stream:
+                buffer.append(event)
+                msg = event[0] if isinstance(event, tuple) else event
+                content = getattr(msg, "content", None)
+                if content:
+                    accumulated += content
+
+            if accumulated:
+                kwargs = _build_analyze_kwargs(accumulated, "assistant", self.params)
+                resp = self.client.interactions.analyze(**kwargs)
+                result = _extract_result(resp, "assistant")
+                if result.block:
+                    raise OutputBlockedError(
+                        "Output blocked by HiddenLayer: content was flagged as malicious"
+                    )
+
+            yield from buffer
+            return
+
+        # Windowed mode: yield events immediately, fire scans in background.
+        window: deque[Any] = deque()
+        carry: list[Any] = []  # overlap events from previous window
+
+        for event in stream:
+            msg = event[0] if isinstance(event, tuple) else event
+            content = getattr(msg, "content", None)
+
+            window.append(content or "")
+
+            if len(window) >= threshold:
+                scan_parts = [c for c in [*carry, *window] if c]
+                scan_text = "".join(scan_parts)
+                if scan_text:
+                    self._submit_scan_background(scan_text)
+
+                # Keep the last *overlap* items for the next window.
+                carry = list(window)[-overlap:] if overlap > 0 else []
+                window.clear()
+
+            yield event
+
+        # Flush remaining events in the window.
+        if window:
+            scan_parts = [c for c in [*carry, *window] if c]
+            scan_text = "".join(scan_parts)
+            if scan_text:
+                self._submit_scan_background(scan_text)
+
+    def _submit_scan_background(self, text: str) -> None:
+        """Fire-and-forget a scan in a background thread."""
+        kwargs = _build_analyze_kwargs(text, "assistant", self.params)
+
+        def _scan() -> None:
+            try:
+                resp = self.client.interactions.analyze(**kwargs)
+                result = _extract_result(resp, "assistant")
+                if result.block:
+                    logger.warning("HiddenLayer blocked streamed output chunk")
+            except Exception:
+                logger.exception("Background HiddenLayer scan failed")
+
+        threading.Thread(target=_scan, daemon=True).start()
