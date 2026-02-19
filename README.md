@@ -101,6 +101,43 @@ if __name__ == "__main__":
 
 ```
 
+#### Streaming Usage
+
+`safe_stream` wraps any output stream, forwarding every event unchanged while accumulating text in the background. Once the stream is exhausted the full text is submitted to HiddenLayer for scanning. This is **alert-only** — events are never blocked or modified.
+
+```python
+from hiddenlayer_langchain_guardrails import HiddenLayerGuardrail, HiddenLayerParams
+
+guardrail = HiddenLayerGuardrail(
+    params=HiddenLayerParams(
+        model="gpt-4o-mini",
+        requester_id="example",
+    )
+)
+
+for chunk in guardrail.safe_stream(agent.stream({"messages": [...]})):
+    print(chunk, end="", flush=True)
+```
+
+Async variant:
+
+```python
+from hiddenlayer_langchain_guardrails import AsyncHiddenLayerGuardrail, HiddenLayerParams
+
+guardrail = AsyncHiddenLayerGuardrail(
+    params=HiddenLayerParams(
+        model="gpt-4o-mini",
+        requester_id="example",
+    )
+)
+
+async def main() -> None:
+    async for chunk in guardrail.safe_stream(agent.astream({"messages": [...]})):
+        print(chunk, end="", flush=True)
+```
+
+---
+
 ### How it works
 - `hiddenlayer_langchain_guardrails.middleware` provides `AsyncHiddenLayerGuardrail` and `HiddenLayerGuardrail` and is configured with:
   - Model-level input/output guardrails that analyze user and assistant messages provided when the agent is invoked

@@ -154,50 +154,41 @@ def _apply_tool_input_redaction(request: ToolCallRequest, redacted_payload: str)
 
 
 def _extract_text_from_event(event: Any) -> str:
-    """Best-effort extraction of text content from a stream event.
+    """Extract text content from a LangGraph stream event.
 
-    Handles LangChain ``StreamEvent`` dicts (``astream_events``), ``AIMessageChunk``
-    objects (``astream`` / ``stream``), plain strings, and arbitrary objects with a
-    ``.content`` attribute.  Returns an empty string when no text can be extracted.
+    Supports two LangGraph streaming modes:
+    - ``stream_mode="messages"``: ``(AIMessageChunk, metadata)`` tuple
+    - ``stream_mode="updates"``: ``{"node_name": {"messages": [AIMessage(...)]}}`` dict
+
+    Returns an empty string when no text can be extracted.
     """
-    # StreamEvent dict from astream_events
-    if isinstance(event, dict):
-        data = event.get("data", {})
-        # "on_chat_model_stream" → data["chunk"]
-        chunk = data.get("chunk")
-        if chunk is not None:
-            content = getattr(chunk, "content", None)
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                parts: list[str] = []
-                for block in content:
-                    if isinstance(block, str):
-                        parts.append(block)
-                    elif isinstance(block, dict) and block.get("type") == "text":
-                        parts.append(block.get("text", ""))
-                return "".join(parts)
-        # "on_chain_stream" → data["chunk"] might be a plain string
-        if isinstance(chunk, str):
-            return chunk
+    # stream_mode="messages": (AIMessageChunk, metadata)
+    if isinstance(event, tuple) and event:
+        chunk = event[0]
+    # stream_mode="updates": {"node_name": {"messages": [AIMessage(...)]}}
+    elif isinstance(event, dict):
+        chunk = None
+        for value in event.values():
+            if isinstance(value, dict):
+                messages = value.get("messages")
+                if messages and isinstance(messages, list):
+                    chunk = messages[-1]
+                    break
+    else:
         return ""
 
-    # AIMessageChunk / BaseMessageChunk (from stream / astream)
-    content = getattr(event, "content", None)
+    content = getattr(chunk, "content", None)
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict) and block.get("type") == "text":
-                parts.append(block.get("text", ""))
-        return "".join(parts)
-
-    # Plain string
-    if isinstance(event, str):
-        return event
+        return "".join(
+            block
+            if isinstance(block, str)
+            else block.get("text", "")
+            if isinstance(block, dict) and block.get("type") == "text"
+            else ""
+            for block in content
+        )
 
     return ""
 
@@ -262,7 +253,6 @@ class AsyncHiddenLayerGuardrail(HiddenLayerGuardrailBase):
         handler: Callable[[ToolCallRequest], Awaitable[Any]],
     ) -> Any:
         tool_call = getattr(request, "tool_call", {}) or {}
-        print(tool_call)
         tool_name = tool_call.get("name", "<unknown>")
         tool_args = tool_call.get("args", {}) or {}
         tool_description = tool_call.get("description", "")
@@ -282,7 +272,7 @@ class AsyncHiddenLayerGuardrail(HiddenLayerGuardrailBase):
 
         return out_res.redacted_content if (out_res.redact and out_res.redacted_content) else output
 
-    async def scan_output_stream(self, stream: AsyncIterator[T]) -> AsyncIterator[T]:
+    async def safe_stream(self, stream: AsyncIterator[T]) -> AsyncIterator[T]:
         """Wrap an asynchronous output stream, forwarding every event and scanning once complete.
 
         Each event from *stream* is yielded immediately.  Text content is
@@ -363,7 +353,7 @@ class HiddenLayerGuardrail(HiddenLayerGuardrailBase):
 
         return out_res.redacted_content if (out_res.redact and out_res.redacted_content) else output
 
-    def scan_output_stream(self, stream: Iterator[T]) -> Iterator[T]:
+    def safe_stream(self, stream: Iterator[T]) -> Iterator[T]:
         """Wrap a synchronous output stream, forwarding every event and scanning once complete.
 
         Each event from *stream* is yielded immediately.  Text content is
