@@ -136,14 +136,13 @@ async def main() -> None:
         print(chunk, end="", flush=True)
 ```
 
----
+### Capability Matrix
 
-### How it works
-- `hiddenlayer_langchain_guardrails.middleware` provides `AsyncHiddenLayerGuardrail` and `HiddenLayerGuardrail` and is configured with:
-  - Model-level input/output guardrails that analyze user and assistant messages provided when the agent is invoked
-  - Tool-level guardrails that inspect arguments before execution and outputs afterward
-  - Readaction in the input and output at the model- and tool-level
-- Guardrails rely on the HiddenLayer REST API and will raise an exception when HiddenLayer signals a blocking action
+| | Alert | Block | Redact |
+|---|:---:|:---:|:---:|
+| **Input Guardrails** | :x: | :white_check_mark: | :white_check_mark: |
+| **Output Guardrails** | :x: | :white_check_mark: | :white_check_mark: |
+| **Streaming Output Guardrails** | :white_check_mark: | :x: | :x: |
 
 ### Development
 Run tests after installing dev deps (`pytest` and `pytest-asyncio`): `pytest tests`
