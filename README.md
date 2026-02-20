@@ -108,6 +108,13 @@ if __name__ == "__main__":
   - Readaction in the input and output at the model- and tool-level
 - Guardrails rely on the HiddenLayer REST API and will raise an exception when HiddenLayer signals a blocking action
 
+### Known Limitations
+
+#### Streaming not supported
+Due to a [bug in LangChain](https://github.com/langchain-ai/langchain/issues/35011), middleware guardrails do not run before tokens are streamed to the caller. This means that when using `agent.stream()` or `agent.astream()`, output guardrails cannot intercept content before it reaches the user, defeating their purpose for streaming workflows.
+
+**Workaround:** Use `agent.invoke()` or `agent.ainvoke()` instead of the streaming variants to ensure guardrails are applied correctly.
+
 ### Development
 Run tests after installing dev deps (`pytest` and `pytest-asyncio`): `pytest tests`
 Code lives in [src/hiddenlayer_langchain_guardrails/middleware.py](./src/hiddenlayer_langchain_guardrails/middleware.py); tests are under the [tests](./tests/) directory.
