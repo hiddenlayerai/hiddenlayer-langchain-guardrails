@@ -140,8 +140,8 @@ async def main() -> None:
 
 | | Alert | Block | Redact |
 |---|:---:|:---:|:---:|
-| **Input Guardrails** | :x: | :white_check_mark: | :white_check_mark: |
-| **Output Guardrails** | :x: | :white_check_mark: | :white_check_mark: |
+| **Input Guardrails** | :white_check_mark: | :white_check_mark: | :white_check_mark: |
+| **Output Guardrails** | :white_check_mark: | :white_check_mark: | :white_check_mark: |
 | **Streaming Output Guardrails** | :white_check_mark: | :x: | :x: |
 
 ### Development
