@@ -5,7 +5,7 @@ import json
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterator, Literal, TypeVar
 
 from hiddenlayer import AsyncHiddenLayer, HiddenLayer
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
@@ -17,6 +17,8 @@ from langgraph.runtime import Runtime
 logger = logging.getLogger(__name__)
 
 Role = Literal["user", "assistant"]
+
+T = TypeVar("T")
 
 
 class HiddenLayerParams(BaseModel):
@@ -151,6 +153,46 @@ def _apply_tool_input_redaction(request: ToolCallRequest, redacted_payload: str)
     return request
 
 
+def _extract_text_from_event(event: Any) -> str:
+    """Extract text content from a LangGraph stream event.
+
+    Supports two LangGraph streaming modes:
+    - ``stream_mode="messages"``: ``(AIMessageChunk, metadata)`` tuple
+    - ``stream_mode="updates"``: ``{"node_name": {"messages": [AIMessage(...)]}}`` dict
+
+    Returns an empty string when no text can be extracted.
+    """
+    # stream_mode="messages": (AIMessageChunk, metadata)
+    if isinstance(event, tuple) and event:
+        chunk = event[0]
+    # stream_mode="updates": {"node_name": {"messages": [AIMessage(...)]}}
+    elif isinstance(event, dict):
+        chunk = None
+        for value in event.values():
+            if isinstance(value, dict):
+                messages = value.get("messages")
+                if messages and isinstance(messages, list):
+                    chunk = messages[-1]
+                    break
+    else:
+        return ""
+
+    content = getattr(chunk, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block
+            if isinstance(block, str)
+            else block.get("text", "")
+            if isinstance(block, dict) and block.get("type") == "text"
+            else ""
+            for block in content
+        )
+
+    return ""
+
+
 class HiddenLayerGuardrailBase(AgentMiddleware):
     """Shared logic for sync/async guardrails (params normalization and block/redact handling)."""
 
@@ -211,7 +253,6 @@ class AsyncHiddenLayerGuardrail(HiddenLayerGuardrailBase):
         handler: Callable[[ToolCallRequest], Awaitable[Any]],
     ) -> Any:
         tool_call = getattr(request, "tool_call", {}) or {}
-        print(tool_call)
         tool_name = tool_call.get("name", "<unknown>")
         tool_args = tool_call.get("args", {}) or {}
         tool_description = tool_call.get("description", "")
@@ -230,6 +271,29 @@ class AsyncHiddenLayerGuardrail(HiddenLayerGuardrailBase):
             raise OutputBlockedError(f"Tool output from {tool_name} blocked by HiddenLayer")
 
         return out_res.redacted_content if (out_res.redact and out_res.redacted_content) else output
+
+    async def safe_stream(self, stream: AsyncIterator[T]) -> AsyncIterator[T]:
+        """Wrap an asynchronous output stream, forwarding every event and scanning once complete.
+
+        Each event from *stream* is yielded immediately.  Text content is
+        extracted from every event and accumulated.  After the stream is
+        exhausted the full text is submitted to HiddenLayer for output
+        scanning.  This operates in **alert-only** mode: detected issues are
+        logged but the stream is never blocked or modified.
+        """
+        buffer: list[str] = []
+        async for event in stream:
+            text = _extract_text_from_event(event)
+            if text:
+                buffer.append(text)
+            yield event
+
+        full_text = "".join(buffer)
+        if full_text:
+            try:
+                await self.analyze(content=full_text, role="assistant")
+            except Exception:
+                logger.exception("HiddenLayer output stream scan failed")
 
 
 class HiddenLayerGuardrail(HiddenLayerGuardrailBase):
@@ -288,3 +352,26 @@ class HiddenLayerGuardrail(HiddenLayerGuardrailBase):
             raise OutputBlockedError(f"Tool output from {tool_name} blocked by HiddenLayer")
 
         return out_res.redacted_content if (out_res.redact and out_res.redacted_content) else output
+
+    def safe_stream(self, stream: Iterator[T]) -> Iterator[T]:
+        """Wrap a synchronous output stream, forwarding every event and scanning once complete.
+
+        Each event from *stream* is yielded immediately.  Text content is
+        extracted from every event and accumulated.  After the stream is
+        exhausted the full text is submitted to HiddenLayer for output
+        scanning.  This operates in **alert-only** mode: detected issues are
+        logged but the stream is never blocked or modified.
+        """
+        buffer: list[str] = []
+        for event in stream:
+            text = _extract_text_from_event(event)
+            if text:
+                buffer.append(text)
+            yield event
+
+        full_text = "".join(buffer)
+        if full_text:
+            try:
+                self.analyze(content=full_text, role="assistant")
+            except Exception:
+                logger.exception("HiddenLayer output stream scan failed")

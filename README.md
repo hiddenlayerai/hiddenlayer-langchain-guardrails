@@ -101,12 +101,48 @@ if __name__ == "__main__":
 
 ```
 
-### How it works
-- `hiddenlayer_langchain_guardrails.middleware` provides `AsyncHiddenLayerGuardrail` and `HiddenLayerGuardrail` and is configured with:
-  - Model-level input/output guardrails that analyze user and assistant messages provided when the agent is invoked
-  - Tool-level guardrails that inspect arguments before execution and outputs afterward
-  - Readaction in the input and output at the model- and tool-level
-- Guardrails rely on the HiddenLayer REST API and will raise an exception when HiddenLayer signals a blocking action
+#### Streaming Usage
+
+`safe_stream` wraps any output stream, forwarding every event unchanged while accumulating text in the background. Once the stream is exhausted the full text is submitted to HiddenLayer for scanning. This is **alert-only** — events are never blocked or modified.
+
+```python
+from hiddenlayer_langchain_guardrails import HiddenLayerGuardrail, HiddenLayerParams
+
+guardrail = HiddenLayerGuardrail(
+    params=HiddenLayerParams(
+        model="gpt-4o-mini",
+        requester_id="example",
+    )
+)
+
+for chunk in guardrail.safe_stream(agent.stream({"messages": [...]})):
+    print(chunk, end="", flush=True)
+```
+
+Async variant:
+
+```python
+from hiddenlayer_langchain_guardrails import AsyncHiddenLayerGuardrail, HiddenLayerParams
+
+guardrail = AsyncHiddenLayerGuardrail(
+    params=HiddenLayerParams(
+        model="gpt-4o-mini",
+        requester_id="example",
+    )
+)
+
+async def main() -> None:
+    async for chunk in guardrail.safe_stream(agent.astream({"messages": [...]})):
+        print(chunk, end="", flush=True)
+```
+
+### Capability Matrix
+
+| | Alert | Block | Redact |
+|---|:---:|:---:|:---:|
+| **Input Guardrails** | :white_check_mark: | :white_check_mark: | :white_check_mark: |
+| **Output Guardrails** | :white_check_mark: | :white_check_mark: | :white_check_mark: |
+| **Streaming Output Guardrails** | :white_check_mark: | :x: | :x: |
 
 ### Development
 Run tests after installing dev deps (`pytest` and `pytest-asyncio`): `pytest tests`
