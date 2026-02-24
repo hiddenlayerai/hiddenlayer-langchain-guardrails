@@ -34,11 +34,11 @@ agent = create_agent(
     model="gpt-4o-mini",
     tools=[get_weather],
     middleware=[HiddenLayerGuardrail(
-    params=HiddenLayerParams(
-        model="gpt-4o-mini",
-        project_id=None,          # or your HL project id
-        requester_id="example",   # optional but recommended
-    )
+        params=HiddenLayerParams(
+            model="gpt-4o-mini",
+            project_id=None,          # or your HL project id
+            requester_id="example",   # optional but recommended
+        )
     )],
 )
 

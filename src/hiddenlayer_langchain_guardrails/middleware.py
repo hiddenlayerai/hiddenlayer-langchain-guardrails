@@ -1,8 +1,9 @@
 from __future__ import annotations
-from langchain.agents import AgentState
+from langchain_core.tools.base import BaseTool
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterator, Literal, TypeVar
@@ -10,9 +11,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Iterator, Literal, T
 from hiddenlayer import AsyncHiddenLayer, HiddenLayer
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
 from langchain.tools.tool_node import ToolCallRequest
-import os
 from pydantic import BaseModel
-from langgraph.runtime import Runtime
 
 logger = logging.getLogger(__name__)
 
@@ -233,9 +232,15 @@ class AsyncHiddenLayerGuardrail(HiddenLayerGuardrailBase):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelResponse:
-        content = _get_request_last_content(request)
-        if content:
-            in_res = await self.analyze(content=content, role="user")
+
+        content_pieces = []
+        if request.tools:
+            tools = [{"name": tool.name, "description": tool.description} for tool in request.tools]
+            content_pieces.append(json.dumps(tools))
+
+        content_pieces.append(_get_request_last_content(request))
+        if content_pieces:
+            in_res = await self.analyze(content="\n".join(content_pieces), role="user")
             request = self._on_input_result(request, in_res)
 
         response = await handler(request)
@@ -313,9 +318,15 @@ class HiddenLayerGuardrail(HiddenLayerGuardrailBase):
         request: ModelRequest,
         handler: Callable[[ModelRequest], ModelResponse],
     ) -> ModelResponse:
-        content = _get_request_last_content(request)
-        if content:
-            in_res = self.analyze(content=content, role="user")
+
+        content_pieces = []
+        if request.tools:
+            tools = [{"name": tool.name, "description": tool.description} for tool in request.tools]
+            content_pieces.append(json.dumps(tools))
+
+        content_pieces.append(_get_request_last_content(request))
+        if content_pieces:
+            in_res = self.analyze(content="\n".join(content_pieces), role="user")
             request = self._on_input_result(request, in_res)
 
         response = handler(request)
