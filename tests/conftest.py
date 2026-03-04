@@ -42,6 +42,7 @@ def dummy_request_classes():
     class Req:
         def __init__(self, messages):
             self.messages = messages
+            self.tools = None
 
         def override(self, *, messages):
             return Req(messages)

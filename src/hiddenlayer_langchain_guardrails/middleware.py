@@ -238,7 +238,10 @@ class AsyncHiddenLayerGuardrail(HiddenLayerGuardrailBase):
             tools = [{"name": tool.name, "description": tool.description} for tool in request.tools]
             content_pieces.append(json.dumps(tools))
 
-        content_pieces.append(_get_request_last_content(request))
+        last_content = _get_request_last_content(request)
+        if last_content:
+            content_pieces.append(last_content)
+
         if content_pieces:
             in_res = await self.analyze(content="\n".join(content_pieces), role="user")
             request = self._on_input_result(request, in_res)
@@ -324,7 +327,10 @@ class HiddenLayerGuardrail(HiddenLayerGuardrailBase):
             tools = [{"name": tool.name, "description": tool.description} for tool in request.tools]
             content_pieces.append(json.dumps(tools))
 
-        content_pieces.append(_get_request_last_content(request))
+        last_content = _get_request_last_content(request)
+        if last_content:
+            content_pieces.append(last_content)
+
         if content_pieces:
             in_res = self.analyze(content="\n".join(content_pieces), role="user")
             request = self._on_input_result(request, in_res)
