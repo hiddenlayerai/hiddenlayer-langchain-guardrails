@@ -409,7 +409,6 @@ class AsyncHiddenLayerGuardrail(HiddenLayerGuardrailBase):
 
         out_content = _get_response_content(response)
         out_tool_calls = _get_response_tool_calls(response)
-        print(out_tool_calls)
         if out_content or out_tool_calls:
             body = _build_response_eval_body(out_content, self.params, tool_calls=out_tool_calls)
             opts = make_request_options(**_extra_options(self.params, roundtrip_id))
