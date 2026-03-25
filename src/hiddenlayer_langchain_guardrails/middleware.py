@@ -4,14 +4,23 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
+
+from langchain_core.runnables import RunnableConfig
+
+try:
+    __version__ = _pkg_version("hiddenlayer-langchain-guardrails")
+except PackageNotFoundError:
+    __version__ = "unknown"
 
 import httpx
 from hiddenlayer import AsyncHiddenLayer, HiddenLayer
 from hiddenlayer._base_client import make_request_options
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
 from langchain_core.tools.base import BaseTool
+from langgraph.config import get_config
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -185,22 +194,35 @@ class HiddenLayerGuardrailBase(AgentMiddleware):
         super().__init__()
         self.params: HiddenLayerParams = params or HiddenLayerParams()
 
-    def _make_request_options(self, roundtrip_id: str) -> Any:
+    def _make_request_options(self, roundtrip_id: str, session_id: str | None = None) -> Any:
         headers: dict[str, str] = {
             "HL-RoundTrip-Id": roundtrip_id,
             "hl-requester-id": self.params.requester_id,
+            "HL-Runtime-Edge-Provider": "langchain-sdk",
+            "HL-Runtime-Edge-Provider-Version": __version__,
         }
         if self.params.project_id:
             headers["HL-Project-Id"] = self.params.project_id
+        if session_id:
+            headers["hl-runtime-session-id"] = session_id
         return make_request_options(extra_headers=headers)
 
-    def _make_request_eval_body(self, messages: list[dict[str, Any]], tools: list[Any] | None) -> dict[str, Any]:
+    def _make_request_eval_body(self, request: ModelRequest) -> dict[str, Any]:
+        messages = _to_openai_messages(request.messages)
+        if request.system_message is not None:
+            content = getattr(request.system_message, "content", None) or ""
+            if not isinstance(content, str):
+                content = json.dumps(content)
+            messages = [{"role": "system", "content": content}, *messages]
         body: dict[str, Any] = {"messages": messages}
         if self.params.model:
             body["model"] = self.params.model
-        if tools:
-            body["tools"] = [_tool_to_openai(t) for t in tools]
+        if request.tools:
+            body["tools"] = [_tool_to_openai(t) for t in request.tools]
         return body
+
+    def _get_session(self, config: RunnableConfig) -> str | None:
+        return config.get("metadata", {}).get("thread_id")
 
     def _make_response_eval_body(
         self, out_content: str | None, out_tool_calls: list[dict[str, Any]] | None
@@ -246,17 +268,21 @@ class AsyncHiddenLayerGuardrail(HiddenLayerGuardrailBase):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelResponse:
-        opts = self._make_request_options(str(uuid4()))
+        config = get_config()
+        session_id = self._get_session(config)
+        opts = self._make_request_options(str(uuid4()), session_id=session_id)
 
-        messages = _to_openai_messages(request.messages)
-        if messages:
+        body = self._make_request_eval_body(request)
+        if body.get("messages"):
             resp = await self.client.post(
                 REQUEST_EVALUATIONS_PATH,
                 cast_to=httpx.Response,
-                body=self._make_request_eval_body(messages, request.tools),
+                body=body,
                 options=opts,
             )
-            request = self._on_input_result(request, _extract_input_result(resp.json(), original_messages=messages))
+            request = self._on_input_result(
+                request, _extract_input_result(resp.json(), original_messages=body["messages"])
+            )
 
         response = await handler(request)
 
@@ -287,26 +313,32 @@ class HiddenLayerGuardrail(HiddenLayerGuardrailBase):
         request: ModelRequest,
         handler: Callable[[ModelRequest], ModelResponse],
     ) -> ModelResponse:
-        opts = self._make_request_options(str(uuid4()))
 
-        messages = _to_openai_messages(request.messages)
-        if messages:
+        config = get_config()
+        session_id = self._get_session(config)
+        opts = self._make_request_options(roundtrip_id=str(uuid4()), session_id=session_id)
+
+        body = self._make_request_eval_body(request)
+        if body.get("messages"):
             resp = self.client.post(
                 REQUEST_EVALUATIONS_PATH,
                 cast_to=httpx.Response,
-                body=self._make_request_eval_body(messages, request.tools),
+                body=body,
                 options=opts,
             )
-            request = self._on_input_result(request, _extract_input_result(resp.json(), original_messages=messages))
+            request = self._on_input_result(
+                request, _extract_input_result(resp.json(), original_messages=body["messages"])
+            )
 
-        response = handler(request)
+        response = handler(request)  # provider interaction
 
         out_content, out_tool_calls = _get_response_output(response)
         if out_content or out_tool_calls:
+            body = self._make_response_eval_body(out_content, out_tool_calls)
             resp = self.client.post(
                 RESPONSE_EVALUATIONS_PATH,
                 cast_to=httpx.Response,
-                body=self._make_response_eval_body(out_content, out_tool_calls),
+                body=body,
                 options=opts,
             )
             response = self._on_output_result(

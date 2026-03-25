@@ -54,6 +54,46 @@ result = agent.invoke(
 print(result["messages"][-1].content)
 ```
 
+#### LangGraph Agent with Memory
+
+Use `InMemorySaver` as a checkpointer to give your agent persistent conversation history across turns:
+
+```python
+from langchain.agents import create_agent
+from langchain.tools import tool
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.memory import InMemorySaver
+
+from hiddenlayer_langchain_guardrails import HiddenLayerGuardrail, HiddenLayerParams
+
+@tool
+def calculator(expression: str) -> str:
+    """Evaluate a basic math expression. Example: '(3 + 5) * 2'."""
+    try:
+        result = eval(expression, {"__builtins__": {}}, {})  # noqa: S307
+        return str(result)
+    except Exception as exc:
+        return f"Error evaluating expression: {exc}"
+
+agent = create_agent(
+    model="gpt-4o-mini",
+    tools=[calculator],
+    middleware=[HiddenLayerGuardrail(
+        params=HiddenLayerParams(requester_id="calculator-agent")
+    )],
+    checkpointer=InMemorySaver(),
+    system_prompt="You are a helpful calculator assistant.",
+)
+
+config: RunnableConfig = {"configurable": {"thread_id": "session-1"}}
+
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "What is (12 * 34) + 1348? Use the calculator tool."}]},
+    config=config,
+)
+print(result["messages"][-1].content)
+```
+
 #### Async Usage
 ```python
 from hiddenlayer_langchain_guardrails import (

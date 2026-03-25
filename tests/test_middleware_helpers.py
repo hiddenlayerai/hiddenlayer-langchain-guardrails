@@ -1,144 +1,205 @@
+"""Unit tests for pure helper functions in middleware.py."""
 import json
 from types import SimpleNamespace
 
 import pytest
 
 from hiddenlayer_langchain_guardrails.middleware import (
-    HiddenLayerActions,
-    HiddenLayerParams,
-    _apply_tool_input_redaction,
-    _build_analyze_kwargs,
-    _extract_result,
-    _get_request_last_content,
-    _get_response_content,
-    _replace_last_message,
-    _set_response_content,
+    AnalysisResult,
+    _extract_input_result,
+    _extract_output_result,
+    _format_tool_call,
+    _get_response_output,
+    _to_openai_messages,
+    _tool_to_openai,
 )
 
 
-def test_build_analyze_kwargs_user_includes_input_and_metadata():
-    params = HiddenLayerParams(model="m1", project_id="p1", requester_id="r1")
-    out = _build_analyze_kwargs("hello", "user", params)
-
-    assert out["metadata"] == {"model": "m1", "requester_id": "r1"}
-    assert out["hl_project_id"] == "p1"
-    assert "input" in out and "output" not in out
-    assert out["input"]["messages"][-1] == {"role": "user", "content": "hello"}
+# ---------------------------------------------------------------------------
+# _extract_input_result
+# ---------------------------------------------------------------------------
 
 
-def test_build_analyze_kwargs_assistant_includes_output_and_no_project_id_when_none():
-    params = HiddenLayerParams(model=None, project_id=None, requester_id="r1")
-    out = _build_analyze_kwargs("ok", "assistant", params)
-
-    assert out["metadata"] == {"model": None, "requester_id": "r1"}
-    assert "hl_project_id" not in out
-    assert "output" in out and "input" not in out
-    assert out["output"]["messages"][-1] == {"role": "assistant", "content": "ok"}
+def test_extract_input_result_block_when_choices_present():
+    data = {"choices": [{"message": {"content": "Sorry, blocked."}, "finish_reason": "stop"}]}
+    result = _extract_input_result(data, original_messages=[{"role": "user", "content": "hi"}])
+    assert result == AnalysisResult(block=True, redact=False, redacted_content=None)
 
 
-def test_extract_result_allow_no_modified(make_hl_response):
-    resp = make_hl_response(action=None, role="user")
-    res = _extract_result(resp, "user")
-    assert res.block is False
-    assert res.redact is False
-    assert res.redacted_content is None
+def test_extract_input_result_allow_when_content_unchanged():
+    original = [{"role": "user", "content": "hello"}]
+    result = _extract_input_result({"messages": original}, original_messages=original)
+    assert result == AnalysisResult(block=False, redact=False, redacted_content=None)
 
 
-def test_extract_result_block(make_hl_response):
-    resp = make_hl_response(action=HiddenLayerActions.BLOCK, role="user")
-    res = _extract_result(resp, "user")
-    assert res.block is True
-    assert res.redact is False
-    assert res.redacted_content is None
+def test_extract_input_result_redact_when_last_message_content_differs():
+    original = [{"role": "user", "content": "hello"}]
+    returned = [{"role": "user", "content": "REDACTED"}]
+    result = _extract_input_result({"messages": returned}, original_messages=original)
+    assert result == AnalysisResult(block=False, redact=True, redacted_content="REDACTED")
 
 
-def test_extract_result_redact_user_pulls_modified_input(make_hl_response):
-    resp = make_hl_response(action=HiddenLayerActions.REDACT, role="user", redacted_text="X")
-    res = _extract_result(resp, "user")
-    assert res.block is False
-    assert res.redact is True
-    assert res.redacted_content == "X"
+def test_extract_input_result_allow_without_original_messages():
+    data = {"messages": [{"role": "user", "content": "hi"}]}
+    result = _extract_input_result(data)
+    assert result == AnalysisResult(block=False, redact=False, redacted_content=None)
 
 
-def test_extract_result_redact_assistant_pulls_modified_output(make_hl_response):
-    resp = make_hl_response(action=HiddenLayerActions.REDACT, role="assistant", redacted_text="Y")
-    res = _extract_result(resp, "assistant")
-    assert res.redact is True
-    assert res.redacted_content == "Y"
+def test_extract_input_result_allow_when_messages_empty():
+    result = _extract_input_result({})
+    assert result == AnalysisResult(block=False, redact=False, redacted_content=None)
 
 
-def test_extract_result_redact_missing_modified_data_is_safe():
-    resp = SimpleNamespace(evaluation=SimpleNamespace(action=HiddenLayerActions.REDACT), modified_data=None)
-    res = _extract_result(resp, "user")
-    assert res.redact is True
-    assert res.redacted_content is None
+# ---------------------------------------------------------------------------
+# _extract_output_result
+# ---------------------------------------------------------------------------
 
 
-def test_get_request_last_content_handles_empty_and_non_string(dummy_request_classes):
-    Msg, Req = dummy_request_classes
-
-    assert _get_request_last_content(Req([])) is None
-    assert _get_request_last_content(Req([Msg(None)])) is None
-    assert _get_request_last_content(Req([Msg(123)])) is None
-    assert _get_request_last_content(Req([Msg("")])) is None
-    assert _get_request_last_content(Req([Msg("hi")])) == "hi"
+def test_extract_output_result_allow_no_choices():
+    result = _extract_output_result({})
+    assert result == AnalysisResult(block=False, redact=False, redacted_content=None)
 
 
-def test_replace_last_message_replaces_only_last(dummy_request_classes):
-    Msg, Req = dummy_request_classes
-    req = Req([Msg("a"), Msg("b")])
-
-    new_req = _replace_last_message(req, "X")
-    assert [m.content for m in req.messages] == ["a", "b"]  # original unchanged
-    assert [m.content for m in new_req.messages] == ["a", "X"]
+def test_extract_output_result_allow_when_content_matches():
+    data = {"choices": [{"message": {"content": "hello"}, "finish_reason": "stop"}]}
+    result = _extract_output_result(data, original_content="hello")
+    assert result == AnalysisResult(block=False, redact=False, redacted_content=None)
 
 
-def test_get_and_set_response_content(dummy_response_class):
-    Resp = dummy_response_class
-    resp = Resp("hello")
-
-    assert _get_response_content(resp) == "hello"
-    _set_response_content(resp, "X")
-    assert _get_response_content(resp) == "X"
-
-    # If message is None, setter should be safe
-    resp2 = SimpleNamespace(message=None)
-    _set_response_content(resp2, "Y")  # no error
+def test_extract_output_result_redact_when_content_differs():
+    data = {"choices": [{"message": {"content": "REDACTED"}, "finish_reason": "stop"}]}
+    result = _extract_output_result(data, original_content="hello")
+    assert result == AnalysisResult(block=False, redact=True, redacted_content="REDACTED")
 
 
-def test_apply_tool_input_redaction_valid_json_updates_args(dummy_tool_request_class):
-    ToolReq = dummy_tool_request_class
-    req = ToolReq({"name": "t", "args": {"a": "secret"}})
-
-    redacted = json.dumps({"args": {"a": "REDACTED"}}, ensure_ascii=False)
-    out = _apply_tool_input_redaction(req, redacted)
-
-    assert out is req  # in-place
-    assert req.tool_call["args"] == {"a": "REDACTED"}
+def test_extract_output_result_allow_no_original_content():
+    data = {"choices": [{"message": {"content": "something"}, "finish_reason": "stop"}]}
+    result = _extract_output_result(data, original_content=None)
+    assert result == AnalysisResult(block=False, redact=False, redacted_content=None)
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        "not-json",
-        json.dumps(["args", {"a": 1}]),
-        json.dumps({"noargs": {}}),
-        json.dumps({"args": "not-a-dict"}),
-    ],
-)
-def test_apply_tool_input_redaction_invalid_payload_no_change(dummy_tool_request_class, payload):
-    ToolReq = dummy_tool_request_class
-    req = ToolReq({"name": "t", "args": {"a": "secret"}})
-
-    out = _apply_tool_input_redaction(req, payload)
-    assert out is req
-    assert req.tool_call["args"] == {"a": "secret"}
+# ---------------------------------------------------------------------------
+# _format_tool_call
+# ---------------------------------------------------------------------------
 
 
-def test_apply_tool_input_redaction_non_dict_tool_call_no_change(dummy_tool_request_class):
-    ToolReq = dummy_tool_request_class
-    req = ToolReq(tool_call=None)
+def test_format_tool_call_basic():
+    tc = {"id": "call_1", "name": "my_tool", "args": {"x": 1}}
+    out = _format_tool_call(tc)
+    assert out == {
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "my_tool", "arguments": json.dumps({"x": 1})},
+    }
 
-    redacted = json.dumps({"args": {"a": "REDACTED"}})
-    out = _apply_tool_input_redaction(req, redacted)
-    assert out is req
+
+def test_format_tool_call_missing_fields_use_defaults():
+    out = _format_tool_call({})
+    assert out["id"] == ""
+    assert out["function"]["name"] == ""
+    assert out["function"]["arguments"] == "{}"
+
+
+# ---------------------------------------------------------------------------
+# _to_openai_messages
+# ---------------------------------------------------------------------------
+
+
+def _msg(type_, content, tool_calls=None, tool_call_id=None):
+    ns = SimpleNamespace(type=type_, content=content, tool_calls=tool_calls, tool_call_id=tool_call_id)
+    return ns
+
+
+def test_to_openai_messages_human():
+    msgs = [_msg("human", "hello")]
+    out = _to_openai_messages(msgs)
+    assert out == [{"role": "user", "content": "hello"}]
+
+
+def test_to_openai_messages_ai():
+    msgs = [_msg("ai", "world")]
+    out = _to_openai_messages(msgs)
+    assert out == [{"role": "assistant", "content": "world"}]
+
+
+def test_to_openai_messages_system():
+    msgs = [_msg("system", "You are a bot")]
+    out = _to_openai_messages(msgs)
+    assert out == [{"role": "system", "content": "You are a bot"}]
+
+
+def test_to_openai_messages_tool():
+    msgs = [_msg("tool", "result text", tool_call_id="call_1")]
+    out = _to_openai_messages(msgs)
+    assert out == [{"role": "tool", "content": "result text", "tool_call_id": "call_1"}]
+
+
+def test_to_openai_messages_assistant_with_tool_calls():
+    tc = {"id": "c1", "name": "fn", "args": {"a": 1}}
+    msgs = [_msg("ai", None, tool_calls=[tc])]
+    out = _to_openai_messages(msgs)
+    assert len(out) == 1
+    assert out[0]["role"] == "assistant"
+    assert out[0]["content"] is None
+    assert out[0]["tool_calls"][0]["function"]["name"] == "fn"
+
+
+def test_to_openai_messages_non_string_content_serialized():
+    msgs = [_msg("human", {"key": "val"})]
+    out = _to_openai_messages(msgs)
+    assert out[0]["content"] == json.dumps({"key": "val"})
+
+
+# ---------------------------------------------------------------------------
+# _tool_to_openai
+# ---------------------------------------------------------------------------
+
+
+def test_tool_to_openai_from_dict():
+    tool = {
+        "name": "my_tool",
+        "description": "does stuff",
+        "parameters": {"type": "object", "properties": {"x": {"type": "integer"}}},
+    }
+    out = _tool_to_openai(tool)
+    assert out["type"] == "function"
+    assert out["function"]["name"] == "my_tool"
+    assert out["function"]["description"] == "does stuff"
+    assert out["function"]["parameters"]["properties"]["x"] == {"type": "integer"}
+
+
+def test_tool_to_openai_dict_missing_fields_uses_defaults():
+    out = _tool_to_openai({})
+    assert out["function"]["name"] == ""
+    assert out["function"]["description"] == ""
+    assert out["function"]["parameters"] == {"type": "object", "properties": {}}
+
+
+# ---------------------------------------------------------------------------
+# _get_response_output
+# ---------------------------------------------------------------------------
+
+
+def test_get_response_output_text_content():
+    msg = SimpleNamespace(content="hello", tool_calls=None)
+    resp = SimpleNamespace(message=msg)
+    content, tool_calls = _get_response_output(resp)
+    assert content == "hello"
+    assert tool_calls is None
+
+
+def test_get_response_output_empty_content_returns_none():
+    msg = SimpleNamespace(content="", tool_calls=None)
+    resp = SimpleNamespace(message=msg)
+    content, _ = _get_response_output(resp)
+    assert content is None
+
+
+def test_get_response_output_tool_calls():
+    tc = {"id": "c1", "name": "fn", "args": {}}
+    msg = SimpleNamespace(content=None, tool_calls=[tc])
+    resp = SimpleNamespace(message=msg)
+    content, tool_calls = _get_response_output(resp)
+    assert content is None
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "fn"
