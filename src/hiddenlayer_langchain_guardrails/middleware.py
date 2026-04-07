@@ -1,23 +1,40 @@
 from __future__ import annotations
-from langchain_core.tools.base import BaseTool
 
 import json
 import logging
 import os
 from dataclasses import dataclass
-from enum import Enum
-from typing import Any, AsyncIterator, Awaitable, Callable, Iterator, Literal, TypeVar
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
+from typing import Any, Awaitable, Callable
+from uuid import uuid4
 
+from langchain_core.runnables import RunnableConfig
+
+try:
+    __version__ = _pkg_version("hiddenlayer-langchain-guardrails")
+except PackageNotFoundError:
+    __version__ = "unknown"
+
+import httpx
 from hiddenlayer import AsyncHiddenLayer, HiddenLayer
+from hiddenlayer._base_client import make_request_options
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
-from langchain.tools.tool_node import ToolCallRequest
+from langchain_core.tools.base import BaseTool
+from langgraph.config import get_config
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
-Role = Literal["user", "assistant"]
+_LANGCHAIN_ROLE_MAP = {
+    "human": "user",
+    "ai": "assistant",
+    "system": "system",
+    "tool": "tool",
+    "function": "function",
+}
 
-T = TypeVar("T")
+REQUEST_EVALUATIONS_PATH = "/detection/v2/request-evaluations"
+RESPONSE_EVALUATIONS_PATH = "/detection/v2/response-evaluations"
 
 
 class HiddenLayerParams(BaseModel):
@@ -26,13 +43,6 @@ class HiddenLayerParams(BaseModel):
     model: str | None = None
     project_id: str | None = os.getenv("HIDDENLAYER_PROJECT_ID")
     requester_id: str = os.getenv("HIDDENLAYER_REQUESTER_ID", "hiddenlayer-langchain-integration")
-
-
-class HiddenLayerActions(str, Enum):
-    """HiddenLayer evaluation actions supported by this middleware."""
-
-    BLOCK = "Block"
-    REDACT = "Redact"
 
 
 class InputBlockedError(Exception):
@@ -52,144 +62,129 @@ class AnalysisResult:
     redacted_content: str | None
 
 
-def _build_analyze_kwargs(content: str, role: Role, params: HiddenLayerParams) -> dict[str, Any]:
-    """Build HiddenLayer `interactions.analyze` kwargs for a single message and role."""
-    metadata = {"model": params.model, "requester_id": params.requester_id}
-    message = {"messages": [{"role": role, "content": content}]}
+def _format_tool_call(tc: dict[str, Any]) -> dict[str, Any]:
+    """Convert a tool call dict to OpenAI function format."""
+    return {
+        "id": tc.get("id", ""),
+        "type": "function",
+        "function": {
+            "name": tc.get("name", ""),
+            "arguments": json.dumps(tc.get("args", {})),
+        },
+    }
 
-    kwargs: dict[str, Any] = {"metadata": metadata}
-    if params.project_id:
-        kwargs["hl_project_id"] = params.project_id
 
-    if role == "user":
-        kwargs["input"] = message
+def _to_openai_messages(messages: list[Any]) -> list[dict[str, Any]]:
+    """Convert LangChain messages to OpenAI chat format."""
+    result = []
+    for msg in messages:
+        role = _LANGCHAIN_ROLE_MAP.get(getattr(msg, "type", "human"), "user")
+
+        if role == "tool":
+            content = getattr(msg, "content", "") or ""
+            if not isinstance(content, str):
+                content = json.dumps(content)
+            entry: dict[str, Any] = {"role": "tool", "content": content}
+            tool_call_id = getattr(msg, "tool_call_id", None)
+            if tool_call_id:
+                entry["tool_call_id"] = tool_call_id
+            result.append(entry)
+            continue
+
+        if role == "assistant":
+            tool_calls = getattr(msg, "tool_calls", None)
+            if tool_calls:
+                result.append(
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [_format_tool_call(tc) for tc in tool_calls],
+                    }
+                )
+                continue
+
+        content = getattr(msg, "content", "") or ""
+        if not isinstance(content, str):
+            content = json.dumps(content)
+        result.append({"role": role, "content": content})
+    return result
+
+
+def _tool_to_openai(tool: BaseTool | dict[str, Any]) -> dict[str, Any]:
+    """Convert a LangChain tool (BaseTool or dict) to OpenAI function tool format."""
+    if isinstance(tool, dict):
+        name = tool.get("name", "")
+        description = tool.get("description", "")
+        parameters = tool.get("parameters", {"type": "object", "properties": {}})
     else:
-        kwargs["output"] = message
-
-    return kwargs
-
-
-def _extract_result(response: Any, role: Role) -> AnalysisResult:
-    """Extract block/redact decisions (and redacted content if present) from a HiddenLayer response."""
-    action = getattr(getattr(response, "evaluation", None), "action", None)
-    logger.debug("HiddenLayer evaluation.action=%r response=%r", action, response)
-
-    block = action == HiddenLayerActions.BLOCK
-    redact = action == HiddenLayerActions.REDACT
-
-    redacted_content: str | None = None
-    modified = getattr(response, "modified_data", None)
-    if redact and modified:
-        container = modified.input if role == "user" else modified.output
-        msgs = getattr(container, "messages", None)
-        if msgs:
-            redacted_content = msgs[-1].content
-
-    return AnalysisResult(block=block, redact=redact, redacted_content=redacted_content)
+        name = tool.name
+        description = tool.description
+        args_schema = getattr(tool, "args_schema", None)
+        if args_schema is not None:
+            if isinstance(args_schema, dict):
+                parameters = args_schema
+            else:
+                try:
+                    parameters = args_schema.model_json_schema()
+                except AttributeError:
+                    parameters = args_schema.schema()
+        else:
+            parameters = {"type": "object", "properties": {}}
+    return {"type": "function", "function": {"name": name, "description": description, "parameters": parameters}}
 
 
-def _get_request_last_content(request: ModelRequest) -> str | None:
-    """Return last request message content if it is a non-empty string."""
-    if not request.messages:
-        return None
-    content = getattr(request.messages[-1], "content", None)
-    return content if isinstance(content, str) and content else None
-
-
-def _replace_last_message(request: ModelRequest, text: str) -> ModelRequest:
-    """Return a copy of the request with the last message content replaced."""
-    last = request.messages[-1]
-    new_last = last.__class__(content=text)
-    return request.override(messages=[*request.messages[:-1], new_last])
-
-
-def _get_response_content(response: ModelResponse) -> str | None:
-    """Return response message content if it is a non-empty string."""
+def _get_response_output(response: ModelResponse) -> tuple[str | None, list[dict[str, Any]] | None]:
+    """Extract text content and tool calls from a ModelResponse."""
     msg = getattr(response, "message", None) or getattr(response, "result")
-
     if isinstance(msg, list):
         msg = msg[-1]
-
     content = getattr(msg, "content", None)
-
-    # If a model responds saying to run a tool, the content gets parsed into a tool calls field.
-    tool_calls = getattr(msg, "tool_calls", None)
-    if tool_calls:
-        content = json.dumps(tool_calls)
-
-    return content if isinstance(content, str) and content else None
+    content = content if isinstance(content, str) and content else None
+    raw_tool_calls = getattr(msg, "tool_calls", None)
+    tool_calls = [_format_tool_call(tc) for tc in raw_tool_calls] if raw_tool_calls else None
+    return content, tool_calls
 
 
-def _set_response_content(response: ModelResponse, text: str) -> None:
-    """Set response message content in place when present."""
-    msg = getattr(response, "message", None)
-    if msg is not None:
-        msg.content = text
+def _extract_input_result(
+    data: dict[str, Any], original_messages: list[dict[str, Any]] | None = None
+) -> AnalysisResult:
+    """Parse a request-evaluations response.
 
-
-def _apply_tool_input_redaction(request: ToolCallRequest, redacted_payload: str) -> ToolCallRequest:
+    Block:  API returns an OpenAI *response* payload (has ``choices``) instead of echoing the request.
+    Redact: API echoes back the request with the last message content modified.
+    Allow:  API echoes back the request unchanged.
     """
-    Apply tool-argument redactions from a JSON payload.
+    if "choices" in data:
+        logger.debug("HiddenLayer request-evaluations: blocked")
+        return AnalysisResult(block=True, redact=False, redacted_content=None)
 
-    The payload must be a JSON object with an `args` dict (e.g., {"args": {...}}).
-    If parsing fails or the shape is unexpected, the request is returned unchanged.
+    messages = data.get("messages") or []
+    if messages and original_messages:
+        original_last = original_messages[-1].get("content", "")
+        returned_last = messages[-1].get("content", "")
+        if original_last != returned_last:
+            logger.debug("HiddenLayer request-evaluations: redacted")
+            return AnalysisResult(block=False, redact=True, redacted_content=returned_last)
+
+    return AnalysisResult(block=False, redact=False, redacted_content=None)
+
+
+def _extract_output_result(data: dict[str, Any], original_content: str | None = None) -> AnalysisResult:
+    """Parse a response-evaluations response.
+
+    The API always returns an OpenAI response payload. Content is compared
+    against the original to detect redaction.
     """
-    try:
-        parsed = json.loads(redacted_payload)
-    except Exception:
-        logger.warning("Failed to parse redacted tool payload as JSON: %r", redacted_payload)
-        return request
+    choices = data.get("choices") or []
+    if not choices:
+        return AnalysisResult(block=False, redact=False, redacted_content=None)
 
-    if not isinstance(parsed, dict) or "args" not in parsed or not isinstance(parsed["args"], dict):
-        logger.warning("Redacted tool payload missing expected 'args' dict: %r", parsed)
-        return request
+    returned_content = (choices[0].get("message") or {}).get("content")
+    if returned_content is not None and original_content is not None and returned_content != original_content:
+        logger.debug("HiddenLayer response-evaluations: redacted")
+        return AnalysisResult(block=False, redact=True, redacted_content=returned_content)
 
-    tool_call = getattr(request, "tool_call", None)
-    if not isinstance(tool_call, dict):
-        return request
-
-    tool_call["args"] = parsed["args"]
-    return request
-
-
-def _extract_text_from_event(event: Any) -> str:
-    """Extract text content from a LangGraph stream event.
-
-    Supports two LangGraph streaming modes:
-    - ``stream_mode="messages"``: ``(AIMessageChunk, metadata)`` tuple
-    - ``stream_mode="updates"``: ``{"node_name": {"messages": [AIMessage(...)]}}`` dict
-
-    Returns an empty string when no text can be extracted.
-    """
-    # stream_mode="messages": (AIMessageChunk, metadata)
-    if isinstance(event, tuple) and event:
-        chunk = event[0]
-    # stream_mode="updates": {"node_name": {"messages": [AIMessage(...)]}}
-    elif isinstance(event, dict):
-        chunk = None
-        for value in event.values():
-            if isinstance(value, dict):
-                messages = value.get("messages")
-                if messages and isinstance(messages, list):
-                    chunk = messages[-1]
-                    break
-    else:
-        return ""
-
-    content = getattr(chunk, "content", None)
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(
-            block
-            if isinstance(block, str)
-            else block.get("text", "")
-            if isinstance(block, dict) and block.get("type") == "text"
-            else ""
-            for block in content
-        )
-
-    return ""
+    return AnalysisResult(block=False, redact=False, redacted_content=None)
 
 
 class HiddenLayerGuardrailBase(AgentMiddleware):
@@ -197,21 +192,67 @@ class HiddenLayerGuardrailBase(AgentMiddleware):
 
     def __init__(self, params: HiddenLayerParams | None = None):
         super().__init__()
-        # Always keep a concrete params instance so helper functions never see None.
         self.params: HiddenLayerParams = params or HiddenLayerParams()
+
+    def _make_request_options(self, roundtrip_id: str, session_id: str | None = None) -> Any:
+        headers: dict[str, str] = {
+            "HL-RoundTrip-Id": roundtrip_id,
+            "hl-requester-id": self.params.requester_id,
+            "HL-Runtime-Edge-Provider": "langchain-sdk",
+            "HL-Runtime-Edge-Provider-Version": __version__,
+        }
+        if self.params.project_id:
+            headers["HL-Project-Id"] = self.params.project_id
+        if session_id:
+            headers["hl-runtime-session-id"] = session_id
+        return make_request_options(extra_headers=headers)
+
+    def _make_request_eval_body(self, request: ModelRequest) -> dict[str, Any]:
+        messages = _to_openai_messages(request.messages)
+        if request.system_message is not None:
+            content = getattr(request.system_message, "content", None) or ""
+            if not isinstance(content, str):
+                content = json.dumps(content)
+            messages = [{"role": "system", "content": content}, *messages]
+        body: dict[str, Any] = {"messages": messages}
+        if self.params.model:
+            body["model"] = self.params.model
+        if request.tools:
+            body["tools"] = [_tool_to_openai(t) for t in request.tools]
+        return body
+
+    def _get_session(self, config: RunnableConfig) -> str | None:
+        return config.get("metadata", {}).get("thread_id")
+
+    def _make_response_eval_body(
+        self, out_content: str | None, out_tool_calls: list[dict[str, Any]] | None
+    ) -> dict[str, Any]:
+        if out_tool_calls:
+            message: dict[str, Any] = {"role": "assistant", "content": None, "tool_calls": out_tool_calls}
+            finish_reason = "tool_calls"
+        else:
+            message = {"role": "assistant", "content": out_content}
+            finish_reason = "stop"
+        body: dict[str, Any] = {"choices": [{"index": 0, "message": message, "finish_reason": finish_reason}]}
+        if self.params.model:
+            body["model"] = self.params.model
+        return body
 
     def _on_input_result(self, request: ModelRequest, result: AnalysisResult) -> ModelRequest:
         if result.block:
             raise InputBlockedError("Input blocked by HiddenLayer")
         if result.redact and result.redacted_content:
-            return _replace_last_message(request, result.redacted_content)
+            new_last = request.messages[-1].model_copy(update={"content": result.redacted_content})
+            return request.override(messages=[*request.messages[:-1], new_last])
         return request
 
     def _on_output_result(self, response: ModelResponse, result: AnalysisResult) -> ModelResponse:
         if result.block:
             raise OutputBlockedError("Output blocked by HiddenLayer")
         if result.redact and result.redacted_content:
-            _set_response_content(response, result.redacted_content)
+            msg = getattr(response, "message", None)
+            if msg is not None:
+                msg.content = result.redacted_content
         return response
 
 
@@ -222,86 +263,42 @@ class AsyncHiddenLayerGuardrail(HiddenLayerGuardrailBase):
         super().__init__(params=params)
         self.client = client or AsyncHiddenLayer()
 
-    async def analyze(self, *, content: str, role: Role) -> AnalysisResult:
-        kwargs = _build_analyze_kwargs(content, role, self.params)
-        resp = await self.client.interactions.analyze(**kwargs)
-        return _extract_result(resp, role)
-
     async def awrap_model_call(
         self,
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelResponse:
+        config = get_config()
+        session_id = self._get_session(config)
+        opts = self._make_request_options(str(uuid4()), session_id=session_id)
 
-        content_pieces = []
-        if request.tools:
-            tools = [{"name": tool.name, "description": tool.description} for tool in request.tools]
-            content_pieces.append(json.dumps(tools))
-
-        last_content = _get_request_last_content(request)
-        if last_content:
-            content_pieces.append(last_content)
-
-        if content_pieces:
-            in_res = await self.analyze(content="\n".join(content_pieces), role="user")
-            request = self._on_input_result(request, in_res)
+        body = self._make_request_eval_body(request)
+        if body.get("messages"):
+            resp = await self.client.post(
+                REQUEST_EVALUATIONS_PATH,
+                cast_to=httpx.Response,
+                body=body,
+                options=opts,
+            )
+            request = self._on_input_result(
+                request, _extract_input_result(resp.json(), original_messages=body["messages"])
+            )
 
         response = await handler(request)
 
-        out_content = _get_response_content(response)
-        if out_content:
-            out_res = await self.analyze(content=out_content, role="assistant")
-            response = self._on_output_result(response, out_res)
+        out_content, out_tool_calls = _get_response_output(response)
+        if out_content or out_tool_calls:
+            resp = await self.client.post(
+                RESPONSE_EVALUATIONS_PATH,
+                cast_to=httpx.Response,
+                body=self._make_response_eval_body(out_content, out_tool_calls),
+                options=opts,
+            )
+            response = self._on_output_result(
+                response, _extract_output_result(resp.json(), original_content=out_content)
+            )
 
         return response
-
-    async def awrap_tool_call(
-        self,
-        request: ToolCallRequest,
-        handler: Callable[[ToolCallRequest], Awaitable[Any]],
-    ) -> Any:
-        tool_call = getattr(request, "tool_call", {}) or {}
-        tool_name = tool_call.get("name", "<unknown>")
-        tool_args = tool_call.get("args", {}) or {}
-        tool_description = tool_call.get("description", "")
-        tool_payload = {"name": tool_name, "description": tool_description, "args": tool_args}
-        in_res = await self.analyze(content=json.dumps(tool_payload), role="user")
-        if in_res.block:
-            raise InputBlockedError(f"Tool input for {tool_name} blocked by HiddenLayer")
-
-        if in_res.redact and in_res.redacted_content:
-            request = _apply_tool_input_redaction(request, in_res.redacted_content)
-
-        output = await handler(request)
-
-        out_res = await self.analyze(content=str(output), role="user")
-        if out_res.block:
-            raise OutputBlockedError(f"Tool output from {tool_name} blocked by HiddenLayer")
-
-        return out_res.redacted_content if (out_res.redact and out_res.redacted_content) else output
-
-    async def safe_stream(self, stream: AsyncIterator[T]) -> AsyncIterator[T]:
-        """Wrap an asynchronous output stream, forwarding every event and scanning once complete.
-
-        Each event from *stream* is yielded immediately.  Text content is
-        extracted from every event and accumulated.  After the stream is
-        exhausted the full text is submitted to HiddenLayer for output
-        scanning.  This operates in **alert-only** mode: detected issues are
-        logged but the stream is never blocked or modified.
-        """
-        buffer: list[str] = []
-        async for event in stream:
-            text = _extract_text_from_event(event)
-            if text:
-                buffer.append(text)
-            yield event
-
-        full_text = "".join(buffer)
-        if full_text:
-            try:
-                await self.analyze(content=full_text, role="assistant")
-            except Exception:
-                logger.exception("HiddenLayer output stream scan failed")
 
 
 class HiddenLayerGuardrail(HiddenLayerGuardrailBase):
@@ -311,84 +308,41 @@ class HiddenLayerGuardrail(HiddenLayerGuardrailBase):
         super().__init__(params=params)
         self.client = client or HiddenLayer()
 
-    def analyze(self, *, content: str, role: Role) -> AnalysisResult:
-        kwargs = _build_analyze_kwargs(content, role, self.params)
-        resp = self.client.interactions.analyze(**kwargs)
-        return _extract_result(resp, role)
-
     def wrap_model_call(
         self,
         request: ModelRequest,
         handler: Callable[[ModelRequest], ModelResponse],
     ) -> ModelResponse:
 
-        content_pieces = []
-        if request.tools:
-            tools = [{"name": tool.name, "description": tool.description} for tool in request.tools]
-            content_pieces.append(json.dumps(tools))
+        config = get_config()
+        session_id = self._get_session(config)
+        opts = self._make_request_options(roundtrip_id=str(uuid4()), session_id=session_id)
 
-        last_content = _get_request_last_content(request)
-        if last_content:
-            content_pieces.append(last_content)
+        body = self._make_request_eval_body(request)
+        if body.get("messages"):
+            resp = self.client.post(
+                REQUEST_EVALUATIONS_PATH,
+                cast_to=httpx.Response,
+                body=body,
+                options=opts,
+            )
+            request = self._on_input_result(
+                request, _extract_input_result(resp.json(), original_messages=body["messages"])
+            )
 
-        if content_pieces:
-            in_res = self.analyze(content="\n".join(content_pieces), role="user")
-            request = self._on_input_result(request, in_res)
+        response = handler(request)  # provider interaction
 
-        response = handler(request)
-
-        out_content = _get_response_content(response)
-        if out_content:
-            out_res = self.analyze(content=out_content, role="assistant")
-            response = self._on_output_result(response, out_res)
+        out_content, out_tool_calls = _get_response_output(response)
+        if out_content or out_tool_calls:
+            body = self._make_response_eval_body(out_content, out_tool_calls)
+            resp = self.client.post(
+                RESPONSE_EVALUATIONS_PATH,
+                cast_to=httpx.Response,
+                body=body,
+                options=opts,
+            )
+            response = self._on_output_result(
+                response, _extract_output_result(resp.json(), original_content=out_content)
+            )
 
         return response
-
-    def wrap_tool_call(
-        self,
-        request: ToolCallRequest,
-        handler: Callable[[ToolCallRequest], Any],
-    ) -> Any:
-        tool_call = getattr(request, "tool_call", {}) or {}
-        tool_name = tool_call.get("name", "<unknown>")
-        tool_args = tool_call.get("args", {}) or {}
-        tool_description = tool_call.get("description", "")
-
-        tool_payload = {"name": tool_name, "description": tool_description, "args": tool_args}
-        in_res = self.analyze(content=json.dumps(tool_payload), role="user")
-        if in_res.block:
-            raise InputBlockedError(f"Tool input for {tool_name} blocked by HiddenLayer")
-
-        if in_res.redact and in_res.redacted_content:
-            request = _apply_tool_input_redaction(request, in_res.redacted_content)
-
-        output = handler(request)
-
-        out_res = self.analyze(content=str(output), role="user")
-        if out_res.block:
-            raise OutputBlockedError(f"Tool output from {tool_name} blocked by HiddenLayer")
-
-        return out_res.redacted_content if (out_res.redact and out_res.redacted_content) else output
-
-    def safe_stream(self, stream: Iterator[T]) -> Iterator[T]:
-        """Wrap a synchronous output stream, forwarding every event and scanning once complete.
-
-        Each event from *stream* is yielded immediately.  Text content is
-        extracted from every event and accumulated.  After the stream is
-        exhausted the full text is submitted to HiddenLayer for output
-        scanning.  This operates in **alert-only** mode: detected issues are
-        logged but the stream is never blocked or modified.
-        """
-        buffer: list[str] = []
-        for event in stream:
-            text = _extract_text_from_event(event)
-            if text:
-                buffer.append(text)
-            yield event
-
-        full_text = "".join(buffer)
-        if full_text:
-            try:
-                self.analyze(content=full_text, role="assistant")
-            except Exception:
-                logger.exception("HiddenLayer output stream scan failed")

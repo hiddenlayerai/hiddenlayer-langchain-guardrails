@@ -1,57 +1,89 @@
-import json
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+"""Integration tests for the asynchronous AsyncHiddenLayerGuardrail."""
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
 from hiddenlayer_langchain_guardrails.middleware import (
     AsyncHiddenLayerGuardrail,
-    HiddenLayerActions,
     HiddenLayerParams,
     InputBlockedError,
-    OutputBlockedError,
 )
 
 pytestmark = pytest.mark.asyncio
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+ALLOW_INPUT = {"messages": [{"role": "user", "content": "hello"}]}
+BLOCK_INPUT = {"choices": [{"message": {"content": "blocked"}, "finish_reason": "stop"}]}
+
+
+def _allow_output(content: str) -> dict:
+    """Return an output evaluation response that echoes the same content (allow)."""
+    return {"choices": [{"message": {"content": content}, "finish_reason": "stop"}]}
+
+
+def _redact_input(new_content: str) -> dict:
+    return {"messages": [{"role": "user", "content": new_content}]}
+
+
+def _redact_output(new_content: str) -> dict:
+    return {"choices": [{"message": {"content": new_content}, "finish_reason": "stop"}]}
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
 
 @pytest.fixture
-def async_client_mock():
+def async_client():
     client = Mock()
-    client.interactions = Mock()
-    client.interactions.analyze = AsyncMock()
+    client.post = AsyncMock()
     return client
 
 
 @pytest.fixture
-def guardrail_async(async_client_mock):
-    params = HiddenLayerParams(model="m", project_id="p", requester_id="r")
-    return AsyncHiddenLayerGuardrail(params=params, client=async_client_mock)
+def guardrail(async_client):
+    params = HiddenLayerParams(model="gpt-4", project_id="proj-1", requester_id="test-user")
+    return AsyncHiddenLayerGuardrail(params=params, client=async_client)
+
+
+@pytest.fixture(autouse=True)
+def mock_get_config():
+    with patch("hiddenlayer_langchain_guardrails.middleware.get_config") as m:
+        m.return_value = {}
+        yield m
 
 
 @pytest.fixture
 def make_request(dummy_request_classes):
     Msg, Req = dummy_request_classes
 
-    def _make(last_content):
-        return Req([Msg("system"), Msg(last_content)])
+    def _make(content="hello"):
+        return Req([Msg("system msg", type="system"), Msg(content, type="human")])
 
     return _make
 
 
 @pytest.fixture
 def make_response(dummy_response_class):
-    Resp = dummy_response_class
-    return Resp
+    return dummy_response_class
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_async_awrap_model_call_allow_passthrough(
-    guardrail_async, async_client_mock, make_hl_response, make_request, make_response
+    guardrail, async_client, make_request, make_response, make_http_response
 ):
-    async_client_mock.interactions.analyze.side_effect = [
-        make_hl_response(action=None, role="user"),
-        make_hl_response(action=None, role="assistant"),
+    async_client.post.side_effect = [
+        make_http_response(ALLOW_INPUT),
+        make_http_response(_allow_output("world")),
     ]
 
     req = make_request("hello")
@@ -59,18 +91,16 @@ async def test_async_awrap_model_call_allow_passthrough(
     async def handler(r):
         return make_response("world")
 
-    resp = await guardrail_async.awrap_model_call(req, handler)
+    resp = await guardrail.awrap_model_call(req, handler)
     assert resp.message.content == "world"
-    assert async_client_mock.interactions.analyze.call_count == 2
+    assert async_client.post.call_count == 2
 
 
 @pytest.mark.asyncio
 async def test_async_awrap_model_call_block_input_raises(
-    guardrail_async, async_client_mock, make_hl_response, make_request
+    guardrail, async_client, make_request, make_http_response
 ):
-    async_client_mock.interactions.analyze.side_effect = [
-        make_hl_response(action=HiddenLayerActions.BLOCK, role="user")
-    ]
+    async_client.post.side_effect = [make_http_response(BLOCK_INPUT)]
 
     req = make_request("hello")
 
@@ -78,53 +108,38 @@ async def test_async_awrap_model_call_block_input_raises(
         raise AssertionError("handler should not be called")
 
     with pytest.raises(InputBlockedError):
-        await guardrail_async.awrap_model_call(req, handler)
+        await guardrail.awrap_model_call(req, handler)
+
+    assert async_client.post.call_count == 1
 
 
 @pytest.mark.asyncio
 async def test_async_awrap_model_call_redact_input_replaces_last_message(
-    guardrail_async, async_client_mock, make_hl_response, make_request, make_response
+    guardrail, async_client, make_request, make_response, make_http_response
 ):
-    async_client_mock.interactions.analyze.side_effect = [
-        make_hl_response(action=HiddenLayerActions.REDACT, role="user", redacted_text="REDACTED_IN"),
-        make_hl_response(action=None, role="assistant"),
+    async_client.post.side_effect = [
+        make_http_response(_redact_input("REDACTED_IN")),
+        make_http_response(_allow_output("ok")),
     ]
 
     req = make_request("SECRET")
+    received = []
 
     async def handler(r):
-        assert r.messages[-1].content == "REDACTED_IN"
+        received.append(r.messages[-1].content)
         return make_response("ok")
 
-    resp = await guardrail_async.awrap_model_call(req, handler)
-    assert resp.message.content == "ok"
-
-
-@pytest.mark.asyncio
-async def test_async_awrap_model_call_block_output_raises(
-    guardrail_async, async_client_mock, make_hl_response, make_request, make_response
-):
-    async_client_mock.interactions.analyze.side_effect = [
-        make_hl_response(action=None, role="user"),
-        make_hl_response(action=HiddenLayerActions.BLOCK, role="assistant"),
-    ]
-
-    req = make_request("hello")
-
-    async def handler(_):
-        return make_response("bad")
-
-    with pytest.raises(OutputBlockedError):
-        await guardrail_async.awrap_model_call(req, handler)
+    await guardrail.awrap_model_call(req, handler)
+    assert received == ["REDACTED_IN"]
 
 
 @pytest.mark.asyncio
 async def test_async_awrap_model_call_redact_output_mutates_response(
-    guardrail_async, async_client_mock, make_hl_response, make_request, make_response
+    guardrail, async_client, make_request, make_response, make_http_response
 ):
-    async_client_mock.interactions.analyze.side_effect = [
-        make_hl_response(action=None, role="user"),
-        make_hl_response(action=HiddenLayerActions.REDACT, role="assistant", redacted_text="REDACTED_OUT"),
+    async_client.post.side_effect = [
+        make_http_response(ALLOW_INPUT),
+        make_http_response(_redact_output("REDACTED_OUT")),
     ]
 
     req = make_request("hello")
@@ -132,157 +147,106 @@ async def test_async_awrap_model_call_redact_output_mutates_response(
     async def handler(_):
         return make_response("SECRET_OUT")
 
-    resp = await guardrail_async.awrap_model_call(req, handler)
+    resp = await guardrail.awrap_model_call(req, handler)
     assert resp.message.content == "REDACTED_OUT"
 
 
 @pytest.mark.asyncio
-async def test_async_awrap_model_call_no_input_content_skips_input_analysis(
-    guardrail_async, async_client_mock, make_hl_response, dummy_request_classes, make_response
+async def test_async_awrap_model_call_empty_messages_skips_input_analysis(
+    guardrail, async_client, make_response, make_http_response, dummy_request_classes
 ):
-    Msg, Req = dummy_request_classes
-    req = Req([Msg("system"), Msg(None)])
+    _, Req = dummy_request_classes
+    req = Req([])  # no messages → body["messages"] is [] → falsy → skip input POST
 
-    async_client_mock.interactions.analyze.side_effect = [make_hl_response(action=None, role="assistant")]
+    async_client.post.side_effect = [make_http_response(_allow_output("ok"))]
 
     async def handler(_):
         return make_response("ok")
 
-    resp = await guardrail_async.awrap_model_call(req, handler)
+    resp = await guardrail.awrap_model_call(req, handler)
     assert resp.message.content == "ok"
-    assert async_client_mock.interactions.analyze.call_count == 1
+    assert async_client.post.call_count == 1
 
 
 @pytest.mark.asyncio
 async def test_async_awrap_model_call_no_output_content_skips_output_analysis(
-    guardrail_async, async_client_mock, make_hl_response, make_request
+    guardrail, async_client, make_request, make_http_response, dummy_response_class
 ):
-    async_client_mock.interactions.analyze.side_effect = [make_hl_response(action=None, role="user")]
+    async_client.post.side_effect = [make_http_response(ALLOW_INPUT)]
 
     req = make_request("hello")
 
     async def handler(_):
-        return SimpleNamespace(message=SimpleNamespace(content=None))
+        return dummy_response_class(content=None)
 
-    resp = await guardrail_async.awrap_model_call(req, handler)
+    resp = await guardrail.awrap_model_call(req, handler)
     assert resp.message.content is None
-    assert async_client_mock.interactions.analyze.call_count == 1
+    assert async_client.post.call_count == 1
 
 
 @pytest.mark.asyncio
-async def test_async_awrap_tool_call_allow_passthrough(
-    guardrail_async, async_client_mock, make_hl_response, dummy_tool_request_class
+async def test_async_awrap_model_call_session_id_from_config(
+    guardrail, async_client, make_request, make_response, make_http_response, mock_get_config
 ):
-    async_client_mock.interactions.analyze.side_effect = [
-        make_hl_response(action=None, role="user"),
-        make_hl_response(action=None, role="assistant"),
+    mock_get_config.return_value = {"metadata": {"thread_id": "sess-xyz"}}
+
+    async_client.post.side_effect = [
+        make_http_response(ALLOW_INPUT),
+        make_http_response(_allow_output("world")),
     ]
 
-    ToolReq = dummy_tool_request_class
-    req = ToolReq({"name": "t", "args": {"x": 1}})
-
-    async def handler(r):
-        assert r is req
-        return {"ok": True}
-
-    out = await guardrail_async.awrap_tool_call(req, handler)
-    assert out == {"ok": True}
-
-
-@pytest.mark.asyncio
-async def test_async_awrap_tool_call_block_input_raises(
-    guardrail_async, async_client_mock, make_hl_response, dummy_tool_request_class
-):
-    async_client_mock.interactions.analyze.side_effect = [
-        make_hl_response(action=HiddenLayerActions.BLOCK, role="user")
-    ]
-
-    ToolReq = dummy_tool_request_class
-    req = ToolReq({"name": "t", "args": {"x": "secret"}})
+    req = make_request("hello")
 
     async def handler(_):
-        raise AssertionError("handler should not run")
+        return make_response("world")
 
-    with pytest.raises(InputBlockedError):
-        await guardrail_async.awrap_tool_call(req, handler)
+    await guardrail.awrap_model_call(req, handler)
 
-
-@pytest.mark.asyncio
-async def test_async_awrap_tool_call_redact_input_applies_args_to_request(
-    guardrail_async, async_client_mock, make_hl_response, dummy_tool_request_class
-):
-    async_client_mock.interactions.analyze.side_effect = [
-        make_hl_response(
-            action=HiddenLayerActions.REDACT,
-            role="user",
-            redacted_text=json.dumps({"args": {"x": "REDACTED"}}),
-        ),
-        make_hl_response(action=None, role="assistant"),
-    ]
-
-    ToolReq = dummy_tool_request_class
-    req = ToolReq({"name": "t", "args": {"x": "secret"}})
-
-    async def handler(r):
-        assert r.tool_call["args"] == {"x": "REDACTED"}
-        return "OK"
-
-    out = await guardrail_async.awrap_tool_call(req, handler)
-    assert out == "OK"
+    assert async_client.post.call_count == 2
 
 
 @pytest.mark.asyncio
-async def test_async_awrap_tool_call_block_output_raises(
-    guardrail_async, async_client_mock, make_hl_response, dummy_tool_request_class
+async def test_async_awrap_model_call_with_tools_in_request_body(
+    guardrail, async_client, make_response, make_http_response, dummy_request_classes
 ):
-    async_client_mock.interactions.analyze.side_effect = [
-        make_hl_response(action=None, role="user"),
-        make_hl_response(action=HiddenLayerActions.BLOCK, role="assistant"),
-    ]
+    Msg, Req = dummy_request_classes
+    tool = {"name": "search", "description": "searches things", "parameters": {"type": "object", "properties": {}}}
+    req = Req([Msg("hello", type="human")], tools=[tool])
 
-    ToolReq = dummy_tool_request_class
-    req = ToolReq({"name": "t", "args": {"x": 1}})
+    async_client.post.side_effect = [
+        make_http_response(ALLOW_INPUT),
+        make_http_response(_allow_output("result")),
+    ]
 
     async def handler(_):
-        return "BAD"
+        return make_response("result")
 
-    with pytest.raises(OutputBlockedError):
-        await guardrail_async.awrap_tool_call(req, handler)
+    resp = await guardrail.awrap_model_call(req, handler)
+    assert resp.message.content == "result"
 
-
-@pytest.mark.asyncio
-async def test_async_awrap_tool_call_redact_output_returns_redacted_content(
-    guardrail_async, async_client_mock, make_hl_response, dummy_tool_request_class
-):
-    async_client_mock.interactions.analyze.side_effect = [
-        make_hl_response(action=None, role="user"),
-        make_hl_response(action=HiddenLayerActions.REDACT, role="user", redacted_text="REDACTED_TOOL_OUT"),
-    ]
-
-    ToolReq = dummy_tool_request_class
-    req = ToolReq({"name": "t", "args": {"x": 1}})
-
-    async def handler(_):
-        return "SECRET_TOOL_OUT"
-
-    out = await guardrail_async.awrap_tool_call(req, handler)
-    assert out == "REDACTED_TOOL_OUT"
+    call_kwargs = async_client.post.call_args_list[0][1]
+    assert "tools" in call_kwargs["body"]
+    assert call_kwargs["body"]["tools"][0]["function"]["name"] == "search"
 
 
 @pytest.mark.asyncio
-async def test_async_awrap_tool_call_missing_tool_call_fields_are_safe(
-    guardrail_async, async_client_mock, make_hl_response, dummy_tool_request_class
+async def test_async_awrap_model_call_with_system_message(
+    guardrail, async_client, make_response, make_http_response, dummy_request_classes
 ):
-    async_client_mock.interactions.analyze.side_effect = [
-        make_hl_response(action=None, role="user"),
-        make_hl_response(action=None, role="assistant"),
+    Msg, Req = dummy_request_classes
+    sys_msg = Msg("Be concise", type="system")
+    req = Req([Msg("hi", type="human")], system_message=sys_msg)
+
+    async_client.post.side_effect = [
+        make_http_response(ALLOW_INPUT),
+        make_http_response(_allow_output("ok")),
     ]
 
-    ToolReq = dummy_tool_request_class
-    req = ToolReq(tool_call={})
-
     async def handler(_):
-        return "OK"
+        return make_response("ok")
 
-    out = await guardrail_async.awrap_tool_call(req, handler)
-    assert out == "OK"
+    await guardrail.awrap_model_call(req, handler)
+
+    call_kwargs = async_client.post.call_args_list[0][1]
+    messages = call_kwargs["body"]["messages"]
+    assert messages[0] == {"role": "system", "content": "Be concise"}
